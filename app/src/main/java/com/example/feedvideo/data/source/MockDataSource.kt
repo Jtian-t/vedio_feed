@@ -5,48 +5,32 @@ import kotlinx.coroutines.delay
 
 /**
  * Mock 数据源，提供 100+ 视频 URL，支持分页加载。
- * 使用公共视频源（Google Storage 示例视频）。
+ * 使用公开可访问的 MP4 视频源。
  */
 object MockDataSource {
 
-    // 公共可用的 MP4 视频 URL 列表
+    // 公开可访问的 MP4 视频 URL 列表（已验证可用）
     private val videoUrls = listOf(
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/SubaruOutbackOnStreetAndDirt.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/VolkswagenGTIReview.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WhatCarCanYouGetForAGrand.mp4",
+        "https://media.w3.org/2010/05/sintel/trailer.mp4",       // Sintel 预告片
+        "https://media.w3.org/2010/05/bunny/trailer.mp4",         // Bunny 预告片
+        "https://media.w3.org/2010/05/video/movie_300.mp4",       // W3C 测试视频
+        "https://vjs.zencdn.net/v/oceans.mp4",                    // Oceans
+        "https://www.w3schools.com/html/mov_bbb.mp4",             // Big Buck Bunny 短片
+        "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4",
     )
 
     private val titles = listOf(
-        "大兔子的冒险之旅",
-        "大象之梦",
-        "火焰挑战者",
-        "极限逃脱",
-        "欢乐时光",
-        "极速狂飙",
-        "末日熔炉",
         "辛特尔的传说",
-        "街道与泥地",
-        "钢铁之泪",
-        "大众GTI评测",
-        "公牛奔跑记",
-        "一千块能买什么车",
+        "兔子的春天",
+        "W3C 测试视频",
+        "海洋世界",
+        "大兔子短片",
+        "Blender 动画",
     )
 
     private val authors = listOf(
-        "Blender Foundation", "Blender Foundation", "Google",
-        "Google", "Google", "Google", "Google",
-        "Blender Foundation", "GoPro", "Blender Foundation",
-        "MotorTrend", "Holden", "CarWow"
+        "Blender Foundation", "Blender Foundation", "W3C",
+        "VideoJS", "W3Schools", "Blender"
     )
 
     // 生成 120 条 mock 数据（循环使用 URL）
