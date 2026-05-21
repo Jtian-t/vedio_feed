@@ -7,7 +7,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.feedvideo.player.VideoPlayer
 
@@ -20,17 +19,25 @@ fun VideoPlayerView(
     player: VideoPlayer,
     videoUrl: String,
     isCurrentVideo: Boolean,
-    onSurfaceReady: (SurfaceView) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var surfaceView by remember { mutableStateOf<SurfaceView?>(null) }
+    var surfaceReady by remember { mutableStateOf(false) }
 
-    // 当视频 URL 或播放状态变化时，重新准备
-    LaunchedEffect(videoUrl, isCurrentVideo) {
-        if (isCurrentVideo && surfaceView != null) {
-            surfaceView?.holder?.surface?.let { surface ->
-                player.prepare(videoUrl, surface)
+    // 当 Surface 就绪 + 当前视频 + URL 变化时，准备并自动播放
+    LaunchedEffect(videoUrl, isCurrentVideo, surfaceReady) {
+        if (isCurrentVideo && surfaceReady && surfaceView != null) {
+            val surface = surfaceView?.holder?.surface
+            if (surface != null && surface.isValid) {
+                player.prepareAndPlay(videoUrl, surface)
             }
+        }
+    }
+
+    // 非当前视频时释放资源
+    LaunchedEffect(isCurrentVideo) {
+        if (!isCurrentVideo) {
+            player.release()
         }
     }
 
@@ -46,10 +53,7 @@ fun VideoPlayerView(
                     holder.addCallback(object : android.view.SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: android.view.SurfaceHolder) {
                             surfaceView = this@apply
-                            onSurfaceReady(this@apply)
-                            if (isCurrentVideo) {
-                                player.prepare(videoUrl, holder.surface)
-                            }
+                            surfaceReady = true
                         }
 
                         override fun surfaceChanged(
@@ -58,6 +62,7 @@ fun VideoPlayerView(
                         ) {}
 
                         override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {
+                            surfaceReady = false
                             player.release()
                         }
                     })

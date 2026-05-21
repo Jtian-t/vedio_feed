@@ -80,33 +80,41 @@ fun FeedScreen(
             modifier = Modifier.fillMaxSize(),
             userScrollEnabled = true
         ) {
-            itemsIndexed(videos, key = { _, video -> video.id }) { index, video ->
+            itemsIndexed(
+                videos,
+                key = { _, video -> video.id },
+                contentType = { _, _ -> "video_item" }
+            ) { index, video ->
+                val isCurrent = index == currentIndex
+
                 Box(
                     modifier = Modifier
                         .fillParentMaxSize()
                         .background(Color.Black)
                 ) {
-                    // 视频播放区域
-                    VideoPlayerView(
-                        player = viewModel.player,
-                        videoUrl = video.url,
-                        isCurrentVideo = index == currentIndex,
-                        modifier = Modifier.fillMaxSize()
-                    )
+                    // 仅当前视频创建 SurfaceView，其他显示黑色占位
+                    if (isCurrent) {
+                        VideoPlayerView(
+                            player = viewModel.player,
+                            videoUrl = video.url,
+                            isCurrentVideo = true,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
 
-                    // 点击暂停/播放
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .pointerInput(Unit) {
-                                detectTapGestures(
-                                    onTap = { viewModel.player.togglePlayPause() },
-                                    onLongPress = {
-                                        viewModel.player.setSpeed(2.0f)
-                                    }
-                                )
-                            }
-                    )
+                    // 点击暂停/播放（仅当前视频响应）
+                    if (isCurrent) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(Unit) {
+                                    detectTapGestures(
+                                        onTap = { viewModel.player.togglePlayPause() },
+                                        onLongPress = { viewModel.player.setSpeed(2.0f) }
+                                    )
+                                }
+                        )
+                    }
 
                     // 视频信息叠加层（左下角）
                     VideoInfoOverlay(

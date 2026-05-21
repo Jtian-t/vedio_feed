@@ -56,6 +56,7 @@ class VideoPlayer {
 
     // 播放控制
     private var isPaused = AtomicBoolean(false)
+    private var shouldAutoPlay = AtomicBoolean(false)
     private var seekPosition = -1L
     private var videoDuration = 0L
 
@@ -64,11 +65,12 @@ class VideoPlayer {
     private var audioStartTimeUs = 0L
 
     /**
-     * 准备播放 — 设置数据源和 Surface
+     * 准备播放 — 设置数据源和 Surface（不自动播放）
      */
     fun prepare(url: String, surface: Surface) {
         release()
         isReleased.set(false)
+        shouldAutoPlay.set(false)
         _state.value = State.PREPARING
         this.surface = surface
 
@@ -78,8 +80,36 @@ class VideoPlayer {
                 setupVideoCodec()
                 setupAudioTrack()
                 _duration.value = videoDuration
-                _state.value = State.PAUSED // 准备好后暂停，等待 play() 调用
+                isPaused.set(true)
+                _state.value = State.PAUSED
                 Log.d(TAG, "Prepared: duration=${videoDuration}ms")
+            } catch (e: Exception) {
+                Log.e(TAG, "Prepare failed", e)
+                _state.value = State.ERROR
+            }
+        }
+    }
+
+    /**
+     * 准备并自动播放 — 首帧优化的关键方法
+     */
+    fun prepareAndPlay(url: String, surface: Surface) {
+        release()
+        isReleased.set(false)
+        shouldAutoPlay.set(true)
+        _state.value = State.PREPARING
+        this.surface = surface
+
+        scope.launch {
+            try {
+                setupExtractor(url)
+                setupVideoCodec()
+                setupAudioTrack()
+                _duration.value = videoDuration
+                // 准备好后立即播放
+                isPaused.set(false)
+                _state.value = State.PLAYING
+                Log.d(TAG, "Prepared and playing: duration=${videoDuration}ms")
             } catch (e: Exception) {
                 Log.e(TAG, "Prepare failed", e)
                 _state.value = State.ERROR
