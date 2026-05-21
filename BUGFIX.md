@@ -5,6 +5,7 @@
 - [Bug #1: 视频无法加载播放 — prepare/play 流程断裂](#bug-1-视频无法加载播放--mediacodec-初始化与播放流程断裂)
 - [Bug #2: 视频加载极慢 — 双 MediaExtractor 重复请求](#bug-2-视频加载极慢--双-mediaextractor-重复请求同一-url)
 - [Bug #3: Google Storage URL 返回 403 Forbidden](#bug-3-google-storage-视频-url-全部返回-403-forbidden)
+- [Bug #4: 单 Extractor 空 buffer 干扰视频解码](#bug-4-单-extractor-空-buffer-干扰视频解码)
 
 ---
 
@@ -176,3 +177,79 @@ ext.selectTrack(audioTrackIndex)  // 选中音频
 ---
 
 > **说明**: 以上 3 个 Bug 均为实际开发中遇到的真实问题，包含完整的排查过程和根因分析。后续开发中如遇到新问题将持续补充。
+
+---
+
+## Bug #4: 单 Extractor 空 buffer 干扰视频解码
+
+- **日期**: 2026-05-21
+- **严重程度**: 高
+- **状态**: 已修复
+
+### 现象
+
+修复 Bug #2（双 Extractor → 单 Extractor）后，视频反而更卡了。第一个视频勉强能播放但掉帧严重，滑动到第二个视频后完全无法播放。
+
+### 复现步骤
+
+1. 运行应用，第一个视频画面断断续续
+2. 滑动到第二个视频，画面完全卡住
+3. Logcat 中 MediaCodec 无报错，但无输出帧
+
+### 排查过程
+
+1. ~~检查解码循环~~ — `decodeLoop()` 中发现以下逻辑：
+   ```kotlin
+   val trackIndex = ext.sampleTrackIndex
+   if (trackIndex == videoTrackIndex) {
+       vc.queueInputBuffer(inIdx, 0, size, pts, flags) // 正常
+   } else {
+       vc.queueInputBuffer(inIdx, 0, 0, 0, 0) // ← BUG!
+   }
+   ```
+2. 单 Extractor 同时选中了音视频两个 track，`readSampleData()` 按 PTS 顺序返回下一个 sample
+3. MP4 文件中音视频 sample 是交错排列的（音频-视频-音频-视频...）
+4. 读到音频 sample 时，代码往**视频 Codec** 送了一个空 buffer（size=0, pts=0）
+5. 视频 Codec 将空 buffer 视为有效输入，浪费了一次解码周期
+6. 更严重的是：空 buffer 的 pts=0 会干扰 Codec 的帧序依赖判断（I/P/B 帧）
+
+### 根因
+
+**单 Extractor 选中双 track 时，非目标 track 的 sample 会被错误地送入目标 Codec**。视频 Codec 收到空 buffer 后：
+1. 浪费解码周期处理无效数据
+2. 时间戳错乱（pts=0 破坏帧序）
+3. I/P/B 帧依赖关系被打乱，首帧迟迟无法输出
+
+### 修复方案
+
+改为**双 Extractor 各管各 track**：
+- `videoExtractor`：仅选中视频 track → 数据送入 `videoCodec`
+- `audioExtractor`：仅选中音频 track → 数据写入 `AudioTrack`
+- 两个解码循环独立并行，互不干扰
+
+```kotlin
+// 修复前：单 extractor，音频 sample 干扰视频 codec
+val ext = MediaExtractor().apply { setDataSource(url) }
+ext.selectTrack(videoTrackIndex)
+ext.selectTrack(audioTrackIndex) // 同时选中，readSampleData 交替返回
+// 读到音频 sample 时 → vc.queueInputBuffer(0, 0, 0, 0) ← 空 buffer!
+
+// 修复后：双 extractor 各自独立
+val videoExt = MediaExtractor().apply {
+    setDataSource(url)
+    selectTrack(videoTrackIndex) // 只选视频
+}
+val audioExt = MediaExtractor().apply {
+    setDataSource(url)
+    selectTrack(audioTrackIndex) // 只选音频
+}
+// videoExt.readSampleData() → 只返回视频 sample → 送入 videoCodec ✓
+// audioExt.readSampleData() → 只返回音频 sample → 写入 AudioTrack ✓
+```
+
+### 经验教训
+
+- MediaExtractor 选中多个 track 后，`readSampleData()` 按文件中 sample 的 PTS 顺序返回，不区分 track
+- 不能把非目标 track 的 sample（即使是空 buffer）送入 Codec，会严重干扰解码
+- "单 Extractor 省一次连接"的优化思路在有音频 track 时行不通，必须双 Extractor
+- 性能优化要先确保正确性，再考虑减少请求次数
