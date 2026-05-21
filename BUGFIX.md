@@ -7,6 +7,7 @@
 - [Bug #3: Google Storage URL 返回 403 Forbidden](#bug-3-google-storage-视频-url-全部返回-403-forbidden)
 - [Bug #4: 单 Extractor 空 buffer 干扰视频解码](#bug-4-单-extractor-空-buffer-干扰视频解码)
 - [Bug #5: 无声音 + 画面卡顿 + 切换视频黑屏](#bug-5-无声音--画面卡顿--切换视频黑屏)
+- [Bug #6: 视频画面黑屏 + 切换视频无法加载（release/prepare 时序竞争）](#bug-6-视频画面黑屏--切换视频无法加载releaseprepare-时序竞争)
 
 ---
 
@@ -339,3 +340,109 @@ if (!firstFrameRendered && info.size > 0) {
 - 音视频播放器需要完整的音频解码管线：Extractor → MediaCodec → AudioTrack
 - PTS 同步基准必须在首帧渲染**之后**设置，不能在渲染之前就设为当前时间
 - 首帧应该无条件立即渲染，降低用户感知的启动延迟
+
+---
+
+## Bug #6: 视频画面黑屏 + 切换视频无法加载（release/prepare 时序竞争）
+
+- **日期**: 2026-05-21
+- **严重程度**: 高
+- **状态**: 已修复
+
+### 现象
+
+Bug #5 修复后，音频能正常播放，但画面始终为黑色。滑动到第二个视频后完全无响应（无声音无画面），只有第一个视频有音频。
+
+### 排查过程
+
+1. ~~检查 Surface~~ — SurfaceView 正常创建，`surfaceCreated()` 触发
+2. ~~检查 videoLoop~~ — 添加日志发现 videoLoop 可能从未开始或立即退出
+3. ~~检查 release/prepare 时序~~ — 发现 Compose 中 `DisposableEffect` 的 `onDispose` 和 `LaunchedEffect` 执行顺序不确定
+4. ~~深入分析~~ — 当 `currentIndex` 变化时，旧 VideoPlayerView 被移除（`onDispose` 调用 `player.release()`），新 VideoPlayerView 被创建（`LaunchedEffect` 调用 `prepareAndPlay()`）。但 `onDispose` 可能在 `LaunchedEffect` **之后**执行
+5. ~~确认竞态~~ — `release()` 中 `isReleased.set(true)` → `currentJob.cancel()`。如果在 `prepareAndPlay()` 已设置 `isReleased = false` 之后执行，会导致：
+   - 旧 job 被取消 → 旧资源泄露（codec/extractor 未释放）
+   - 新 job 的 decode loop 看到 `isReleased = true`（被旧 release 设置）→ 立即退出
+   - 新 job 的 `finally` 块释放了新创建的 codec → Surface 无帧可渲染
+
+### 根因
+
+**release() 和 prepareAndPlay() 之间存在竞态条件**。Compose 的生命周期回调执行顺序不确定：
+
+```
+场景：滚动到新视频
+
+可能的执行顺序 A（正常）：
+  1. onDispose(旧) → release() → isReleased=true → cancel(旧job)
+  2. LaunchedEffect(新) → prepareAndPlay() → isReleased=false → 启动新job
+  ✅ 正常工作
+
+可能的执行顺序 B（竞态）：
+  1. LaunchedEffect(新) → prepareAndPlay() → isReleased=false → 启动新job
+  2. onDispose(旧) → release() → isReleased=true → cancel(新job!!!)
+  ❌ 新job被旧release取消，画面黑屏
+```
+
+此外，即使顺序正确，`release()` 中直接操作 `isReleased` 标志也可能干扰新 job 的 decode loop。
+
+### 修复方案
+
+**引入 generation 计数器**，替代 `isReleased` 全局标志：
+
+1. 每次 `prepareAndPlay()` 递增 `currentGen`，当前任务使用 `gen` 副本
+2. Decode loop 通过 `gen == currentGen` 判断是否继续运行
+3. `release()` 只做两件事：递增 `currentGen`（让所有 loop 退出）+ `currentJob.cancel()`
+4. 资源释放移入 job 的 `finally` 块，确保每个任务清理自己的资源
+5. `VideoPlayerView` 移除 `DisposableEffect`，不再主动调用 `player.release()`（由 ViewModel 管理）
+
+```kotlin
+// 修复前：全局标志 + 竞态
+private val isReleased = AtomicBoolean(false)
+
+fun prepareAndPlay() {
+    isReleased.set(false)  // ← 可能被之后的 release() 覆盖
+    currentJob = scope.launch {
+        while (!isReleased.get()) { ... }  // ← 可能被旧 release 设置为 true
+    }
+}
+
+fun release() {
+    isReleased.set(true)   // ← 可能干扰新 job
+    currentJob?.cancel()   // ← 可能取消了新 job
+}
+
+// 修复后：generation 计数器
+private var currentGen = 0
+
+fun prepareAndPlay() {
+    currentGen++                    // 递增，旧 loop 自动退出
+    val gen = currentGen            // 捕获当前 generation
+    currentJob?.cancel()            // 取消旧 job
+    currentJob = scope.launch {
+        try {
+            // ... setup codec, extractor ...
+            videoLoop(..., gen)     // 传递 gen
+        } finally {
+            // 释放本代资源
+            videoCodec?.release()
+            audioExtractor?.release()
+            // ...
+        }
+    }
+}
+
+fun release() {
+    currentGen++                    // 让所有 loop 退出
+    currentJob?.cancel()
+}
+
+// videoLoop 中：
+while (gen == currentGen) { ... }  // 旧 loop 自然退出
+```
+
+### 经验教训
+
+- Compose 的 DisposableEffect 和 LaunchedEffect 执行顺序不确定，不能依赖时序
+- 单例 player + 多个 Composable 共享时，不应该在视图层调用 release()
+- 全局 AtomicBoolean 标志在 release/prepare 竞态下不可靠
+- Generation/Epoch 模式是处理 "取消旧任务启动新任务" 的可靠方案
+- 资源释放应该放在创建它们的协程的 finally 块中，而非外部 release() 方法

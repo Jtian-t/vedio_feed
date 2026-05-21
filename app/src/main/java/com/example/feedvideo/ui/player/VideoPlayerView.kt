@@ -13,6 +13,9 @@ import com.example.feedvideo.player.VideoPlayer
 /**
  * 全屏视频播放 Composable — AndroidView 包裹 SurfaceView。
  * 通过 MediaCodec 渲染视频帧。
+ *
+ * 注意：不主动调用 player.release()，由 ViewModel 管理 player 生命周期。
+ * prepareAndPlay 内部会自动清理上一个视频的资源。
  */
 @Composable
 fun VideoPlayerView(
@@ -25,20 +28,11 @@ fun VideoPlayerView(
     var surfaceReady by remember { mutableStateOf(false) }
 
     // 当 Surface 就绪 + 当前视频 + URL 变化时，准备并自动播放
-    LaunchedEffect(videoUrl, isCurrentVideo, surfaceReady) {
-        if (isCurrentVideo && surfaceReady && surfaceView != null) {
+    LaunchedEffect(videoUrl, surfaceReady) {
+        if (surfaceReady && surfaceView != null) {
             val surface = surfaceView?.holder?.surface
             if (surface != null && surface.isValid) {
                 player.prepareAndPlay(videoUrl, surface)
-            }
-        }
-    }
-
-    // 非当前视频时释放资源
-    DisposableEffect(isCurrentVideo) {
-        onDispose {
-            if (isCurrentVideo) {
-                player.release()
             }
         }
     }
@@ -65,7 +59,6 @@ fun VideoPlayerView(
 
                         override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {
                             surfaceReady = false
-                            player.release()
                         }
                     })
                 }
