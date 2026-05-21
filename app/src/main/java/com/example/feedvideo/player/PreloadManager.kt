@@ -60,8 +60,8 @@ class PreloadManager {
         for (i in startIndex..endIndex) {
             if (i == currentIndex) continue // 当前视频不需要预加载
             val video = videos[i]
-            if (video.url in preloadedUrls) continue
-            if (video.url in preloadJobs) continue
+            if (preloadedUrls.contains(video.url)) continue
+            if (preloadJobs.containsKey(video.url)) continue
 
             preloadVideo(video)
         }
