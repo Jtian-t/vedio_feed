@@ -6,40 +6,33 @@ import android.view.Surface
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 自研视频播放器 — MediaCodec + MediaExtractor + AudioTrack。
  * 禁用 ExoPlayer/IjkPlayer，完全基于 Android 底层 API。
- *
- * 架构：
- *   videoExtractor(仅视频track) → videoCodec → Surface 渲染
- *   audioExtractor(仅音频track) → AudioTrack 音频播放
- *
- * 两个 extractor 独立读取各自 track，互不干扰。
  */
 class VideoPlayer {
 
     companion object {
         private const val TAG = "VideoPlayer"
-        private const val TIMEOUT_US = 5_000L // 5ms
+        private const val TIMEOUT_US = 10_000L
     }
 
     enum class State { IDLE, PREPARING, PLAYING, PAUSED, COMPLETED, ERROR }
 
     private val _state = MutableStateFlow(State.IDLE)
     val state: StateFlow<State> = _state
-
     private val _currentPosition = MutableStateFlow(0L)
     val currentPosition: StateFlow<Long> = _currentPosition
-
     private val _duration = MutableStateFlow(0L)
     val duration: StateFlow<Long> = _duration
 
-    // 双 Extractor — 各自只选中一个 track
     private var videoExtractor: MediaExtractor? = null
     private var audioExtractor: MediaExtractor? = null
     private var videoCodec: MediaCodec? = null
+    private var audioCodec: MediaCodec? = null
     private var audioTrack: AudioTrack? = null
     private var surface: Surface? = null
 
@@ -48,7 +41,6 @@ class VideoPlayer {
     private val isReleased = AtomicBoolean(false)
     private val isPaused = AtomicBoolean(false)
 
-    // 音视频同步
     private var mediaStartTimeUs = -1L
     private var wallStartTimeUs = -1L
 
@@ -62,15 +54,15 @@ class VideoPlayer {
 
         playerJob = scope.launch {
             try {
-                // 1. 创建视频 extractor（只选中视频 track）
+                // ===== 1. 视频 Extractor =====
                 val vExt = MediaExtractor()
                 vExt.setDataSource(url)
                 var videoFormat: MediaFormat? = null
                 for (i in 0 until vExt.trackCount) {
-                    val format = vExt.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("video/")) {
-                        videoFormat = format
+                    val fmt = vExt.getTrackFormat(i)
+                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (mime.startsWith("video/") && videoFormat == null) {
+                        videoFormat = fmt
                         vExt.selectTrack(i)
                     }
                 }
@@ -81,44 +73,47 @@ class VideoPlayer {
                 }
                 videoExtractor = vExt
                 _duration.value = videoFormat.getLong(MediaFormat.KEY_DURATION) / 1000
-                Log.d(TAG, "Video track ready, duration=${_duration.value}ms")
+                Log.d(TAG, "Video: duration=${_duration.value}ms")
 
-                // 2. 创建音频 extractor（只选中音频 track）
-                var audioFormat: MediaFormat? = null
-                val aExt = MediaExtractor()
-                aExt.setDataSource(url)
-                for (i in 0 until aExt.trackCount) {
-                    val format = aExt.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("audio/")) {
-                        audioFormat = format
-                        aExt.selectTrack(i)
-                    }
-                }
-                if (audioFormat != null) {
-                    audioExtractor = aExt
-                    setupAudioTrack(audioFormat)
-                    Log.d(TAG, "Audio track ready")
-                }
-
-                // 3. 配置视频解码器
+                // ===== 2. 视频 Codec =====
                 val videoMime = videoFormat.getString(MediaFormat.KEY_MIME)!!
                 videoCodec = MediaCodec.createDecoderByType(videoMime).apply {
                     configure(videoFormat, surface, null, 0)
                     start()
                 }
-                Log.d(TAG, "Video codec started: $videoMime")
+                Log.d(TAG, "Video codec: $videoMime")
+
+                // ===== 3. 音频 Extractor + Codec =====
+                val aExt = MediaExtractor()
+                aExt.setDataSource(url)
+                var audioFormat: MediaFormat? = null
+                for (i in 0 until aExt.trackCount) {
+                    val fmt = aExt.getTrackFormat(i)
+                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (mime.startsWith("audio/") && audioFormat == null) {
+                        audioFormat = fmt
+                        aExt.selectTrack(i)
+                    }
+                }
+                if (audioFormat != null) {
+                    audioExtractor = aExt
+                    try {
+                        setupAudioPipeline(audioFormat)
+                        Log.d(TAG, "Audio pipeline ready")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Audio setup failed, video-only mode", e)
+                    }
+                }
 
                 _state.value = State.PLAYING
+                Log.d(TAG, "=== Starting playback ===")
 
-                // 4. 并行解码视频和音频
+                // ===== 4. 并行解码 =====
                 coroutineScope {
-                    val videoJob = launch(Dispatchers.Default) { videoDecodeLoop() }
-                    val audioJob = if (audioExtractor != null) {
-                        launch(Dispatchers.Default) { audioDecodeLoop() }
-                    } else null
-                    videoJob.join()
-                    audioJob?.join()
+                    val vJob = launch(Dispatchers.Default) { videoLoop() }
+                    val aJob = launch(Dispatchers.Default) { audioLoop() }
+                    vJob.join()
+                    aJob.cancel()
                 }
 
             } catch (e: Exception) {
@@ -128,19 +123,48 @@ class VideoPlayer {
         }
     }
 
-    // ==================== 视频解码 ====================
+    // ==================== 音频管线 ====================
 
-    private fun videoDecodeLoop() {
+    private fun setupAudioPipeline(format: MediaFormat) {
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: return
+        val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+
+        // AudioTrack（PCM 输出）
+        val channelConfig = if (channelCount == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+        val minBuf = AudioTrack.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT)
+        audioTrack = AudioTrack(
+            AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build(),
+            AudioFormat.Builder().setSampleRate(sampleRate)
+                .setChannelMask(channelConfig)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build(),
+            minBuf * 2, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE
+        )
+        audioTrack?.play()
+
+        // AudioCodec（AAC → PCM 解码）
+        audioCodec = MediaCodec.createDecoderByType(mime).apply {
+            configure(format, null, null, 0)
+            start()
+        }
+        Log.d(TAG, "Audio codec: $mime ${sampleRate}Hz ${channelCount}ch")
+    }
+
+    // ==================== 视频解码循环 ====================
+
+    private fun videoLoop() {
         val ext = videoExtractor ?: return
         val codec = videoCodec ?: return
         val info = MediaCodec.BufferInfo()
         var inputEOS = false
         var outputEOS = false
+        var firstFrameRendered = false
 
         while (!outputEOS && !isReleased.get()) {
             if (isPaused.get()) { Thread.sleep(30); continue }
 
-            // 输入：读取视频 sample 送入 codec
+            // 输入
             if (!inputEOS) {
                 val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
                 if (inIdx >= 0) {
@@ -150,97 +174,104 @@ class VideoPlayer {
                         codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                         inputEOS = true
                     } else {
-                        codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, ext.sampleFlags)
+                        codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
                         ext.advance()
                     }
                 }
             }
 
-            // 输出：取出解码帧渲染
+            // 输出
             val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
             when {
                 outIdx >= 0 -> {
-                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputEOS = true
-                    val render = info.size > 0 && !isPaused.get() && syncFrame(info.presentationTimeUs)
+                    val isEOS = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                    if (isEOS) outputEOS = true
+
+                    // 首帧：立即渲染，不做同步等待
+                    if (!firstFrameRendered && info.size > 0) {
+                        codec.releaseOutputBuffer(outIdx, true)
+                        firstFrameRendered = true
+                        mediaStartTimeUs = info.presentationTimeUs
+                        wallStartTimeUs = System.nanoTime() / 1000
+                        _currentPosition.value = info.presentationTimeUs / 1000
+                        Log.d(TAG, "First frame rendered at ${info.presentationTimeUs / 1000}ms")
+                        continue
+                    }
+
+                    // 后续帧：音视频同步
+                    val render = info.size > 0 && shouldRender(info.presentationTimeUs)
                     codec.releaseOutputBuffer(outIdx, render)
                     if (info.size > 0) _currentPosition.value = info.presentationTimeUs / 1000
                 }
                 outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    Log.d(TAG, "Video output format: ${codec.outputFormat}")
+                    Log.d(TAG, "Video format: ${codec.outputFormat}")
                 }
             }
         }
-
-        if (outputEOS) {
-            _state.value = State.COMPLETED
-            Log.d(TAG, "Video decode completed")
-        }
+        if (outputEOS) { _state.value = State.COMPLETED; Log.d(TAG, "Video done") }
     }
 
-    // ==================== 音频解码 ====================
+    // ==================== 音频解码循环 ====================
 
-    private fun audioDecodeLoop() {
+    private fun audioLoop() {
         val ext = audioExtractor ?: return
+        val codec = audioCodec ?: return
         val track = audioTrack ?: return
+        val info = MediaCodec.BufferInfo()
+        var inputEOS = false
+        var outputEOS = false
 
-        // 音频直接用 extractor 读取 raw data 写入 AudioTrack
-        // 简化处理：不经过 AudioCodec，直接读取压缩数据尝试播放
-        // 如果音频编码不是 PCM，跳过音频
-        val format = ext.getTrackFormat(ext.sampleTrackIndex)
-        val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-        if (mime != "audio/raw" && mime != "audio/mp4a-latc") {
-            // 需要解码的音频，简化跳过（专注视频流畅度）
-            Log.d(TAG, "Audio format $mime, skipping (focus on video)")
-            return
-        }
+        while (!outputEOS && !isReleased.get()) {
+            if (isPaused.get()) { Thread.sleep(30); continue }
 
-        try {
-            val buffer = ByteArray(4096)
-            while (!isReleased.get()) {
-                if (isPaused.get()) { Thread.sleep(30); continue }
-                val size = ext.readSampleData(java.nio.ByteBuffer.wrap(buffer), 0)
-                if (size < 0) break
-                track.write(buffer, 0, size)
-                ext.advance()
+            // 输入
+            if (!inputEOS) {
+                val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
+                if (inIdx >= 0) {
+                    val buf = codec.getInputBuffer(inIdx) ?: continue
+                    val size = ext.readSampleData(buf, 0)
+                    if (size < 0) {
+                        codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputEOS = true
+                    } else {
+                        codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
+                        ext.advance()
+                    }
+                }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio decode error", e)
+
+            // 输出：PCM → AudioTrack
+            val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
+            when {
+                outIdx >= 0 -> {
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputEOS = true
+                    val buf = codec.getOutputBuffer(outIdx) ?: continue
+                    if (info.size > 0) {
+                        val pcm = ByteArray(info.size)
+                        buf.position(info.offset)
+                        buf.limit(info.offset + info.size)
+                        buf.get(pcm)
+                        track.write(pcm, 0, info.size)
+                    }
+                    codec.releaseOutputBuffer(outIdx, false)
+                }
+                outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    Log.d(TAG, "Audio format: ${codec.outputFormat}")
+                }
+            }
         }
-    }
-
-    private fun setupAudioTrack(format: MediaFormat) {
-        val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-        val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-        val channelConfig = if (channelCount == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
-        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT)
-
-        audioTrack = AudioTrack(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build(),
-            AudioFormat.Builder()
-                .setSampleRate(sampleRate)
-                .setChannelMask(channelConfig)
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build(),
-            minBuffer * 2,
-            AudioTrack.MODE_STREAM,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
-        audioTrack?.play()
+        if (outputEOS) Log.d(TAG, "Audio done")
     }
 
     // ==================== 音视频同步 ====================
 
-    private fun syncFrame(presentationTimeUs: Long): Boolean {
+    private fun shouldRender(presentationTimeUs: Long): Boolean {
         val nowUs = System.nanoTime() / 1000
-        if (wallStartTimeUs < 0L) {
-            wallStartTimeUs = nowUs
-            mediaStartTimeUs = presentationTimeUs
-            return true // 首帧立即渲染
-        }
+        if (wallStartTimeUs < 0L) return true // 还没初始化，直接渲染
         val mediaElapsed = presentationTimeUs - mediaStartTimeUs
         val wallElapsed = nowUs - wallStartTimeUs
-        return mediaElapsed <= wallElapsed + 30_000 // 容忍 30ms
+        // 帧时间 <= 当前时间 + 30ms 容忍 → 渲染
+        return mediaElapsed <= wallElapsed + 30_000
     }
 
     // ==================== 播放控制 ====================
@@ -248,7 +279,7 @@ class VideoPlayer {
     fun play() {
         if (isReleased.get()) return
         isPaused.set(false)
-        wallStartTimeUs = -1L
+        wallStartTimeUs = -1L // 重置同步基准，下次首帧立即渲染
         if (_state.value == State.PAUSED || _state.value == State.COMPLETED) _state.value = State.PLAYING
         Log.d(TAG, "Play")
     }
@@ -263,8 +294,7 @@ class VideoPlayer {
     fun togglePlayPause() {
         when (_state.value) {
             State.PLAYING -> pause()
-            State.PAUSED, State.IDLE -> play()
-            State.COMPLETED -> play()
+            State.PAUSED, State.COMPLETED -> play()
             else -> {}
         }
     }
@@ -279,7 +309,7 @@ class VideoPlayer {
 
     fun setSpeed(speed: Float) { Log.d(TAG, "Speed: $speed") }
 
-    // ==================== 资源释放 ====================
+    // ==================== 释放 ====================
 
     fun release() {
         if (isReleased.getAndSet(true)) return
@@ -287,6 +317,8 @@ class VideoPlayer {
         playerJob?.cancel()
         try { videoCodec?.stop(); videoCodec?.release() } catch (_: Exception) {}
         videoCodec = null
+        try { audioCodec?.stop(); audioCodec?.release() } catch (_: Exception) {}
+        audioCodec = null
         try { videoExtractor?.release() } catch (_: Exception) {}
         videoExtractor = null
         try { audioExtractor?.release() } catch (_: Exception) {}

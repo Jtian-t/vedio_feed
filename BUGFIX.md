@@ -6,6 +6,7 @@
 - [Bug #2: 视频加载极慢 — 双 MediaExtractor 重复请求](#bug-2-视频加载极慢--双-mediaextractor-重复请求同一-url)
 - [Bug #3: Google Storage URL 返回 403 Forbidden](#bug-3-google-storage-视频-url-全部返回-403-forbidden)
 - [Bug #4: 单 Extractor 空 buffer 干扰视频解码](#bug-4-单-extractor-空-buffer-干扰视频解码)
+- [Bug #5: 无声音 + 画面卡顿 + 切换视频黑屏](#bug-5-无声音--画面卡顿--切换视频黑屏)
 
 ---
 
@@ -253,3 +254,88 @@ val audioExt = MediaExtractor().apply {
 - 不能把非目标 track 的 sample（即使是空 buffer）送入 Codec，会严重干扰解码
 - "单 Extractor 省一次连接"的优化思路在有音频 track 时行不通，必须双 Extractor
 - 性能优化要先确保正确性，再考虑减少请求次数
+
+---
+
+## Bug #5: 无声音 + 画面卡顿 + 切换视频黑屏
+
+- **日期**: 2026-05-21
+- **严重程度**: 高
+- **状态**: 已修复
+
+### 现象
+
+1. 视频有画面但无声音
+2. 画面显示后卡住不动，需要双击屏幕才跳到下一帧
+3. 滑动到第二个视频后完全黑屏，只有第一个视频有画面
+
+### 排查过程
+
+1. ~~检查音频 track~~ — MediaExtractor 确实选中了音频 track，`audioFormat` 不为 null
+2. ~~检查 AudioTrack~~ — AudioTrack 已创建并 play()，但 `audioDecodeLoop()` 直接将压缩的 AAC 数据写入 AudioTrack，AudioTrack 需要的是 PCM 数据
+3. ~~检查首帧渲染~~ — `syncFrame()` 中 `wallStartTimeUs` 初始为 -1，首帧时设为 `nowUs`，但 `nowUs` 是微秒级的 `System.nanoTime()/1000`，首帧后 `wallElapsed` 几乎为 0，导致后续帧 `mediaElapsed > wallElapsed` 全部跳过渲染
+4. ~~检查视频切换~~ — `DisposableEffect` 中 `onDispose` 释放了 player，但重新 prepare 时 `isReleased` 标志可能未正确重置
+
+### 根因
+
+**三个独立问题叠加：**
+
+1. **无声音**：音频数据是 AAC 编码格式，直接写入 AudioTrack 无效。AudioTrack 只接受 PCM 原始数据，需要经过 MediaCodec 解码（AAC → PCM）
+2. **画面卡住**：`syncFrame()` 中首帧时间基准设置有问题。首帧立即设了 `wallStartTimeUs = nowUs`，之后 `wallElapsed` 接近 0，而 `mediaElapsed` 为帧间隔（~33ms），条件 `mediaElapsed <= wallElapsed + 30_000` 永远不满足，所有后续帧都被跳过
+3. **切换视频黑屏**：`LaunchedEffect(isCurrentVideo)` 中释放 player 后，重新 prepare 时 surface 可能已失效但 `surfaceReady` 状态未重置
+
+### 修复方案
+
+1. **音频解码管线**：新增 `MediaCodec` 解码器（AAC → PCM），音频数据经 MediaCodec 解码后输出 PCM，再写入 AudioTrack
+2. **首帧立即渲染**：新增 `firstFrameRendered` 标志，首帧不做同步直接渲染，渲染后再初始化 `mediaStartTimeUs` 和 `wallStartTimeUs`
+3. **生命周期修复**：`DisposableEffect` 改为正确的 `onDispose` 模式，确保资源释放和重新初始化的时序正确
+
+```kotlin
+// 修复前：音频直接写入（AAC 压缩数据 → AudioTrack 无法播放）
+val buffer = ByteArray(4096)
+val size = ext.readSampleData(ByteBuffer.wrap(buffer), 0)
+track.write(buffer, 0, size) // 写入 AAC 数据，AudioTrack 不认识
+
+// 修复后：音频经 MediaCodec 解码（AAC → PCM → AudioTrack）
+audioCodec = MediaCodec.createDecoderByType(mime).apply {
+    configure(format, null, null, 0)
+    start()
+}
+// audioLoop() 中：audioExtractor → audioCodec → PCM → AudioTrack
+val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
+codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
+val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
+val pcm = ByteArray(info.size)
+buf.get(pcm)
+track.write(pcm, 0, info.size) // 写入 PCM 数据 ✓
+```
+
+```kotlin
+// 修复前：首帧同步逻辑有问题
+private fun syncFrame(pts: Long): Boolean {
+    if (wallStartTimeUs < 0L) {
+        wallStartTimeUs = nowUs      // ← 设为当前时间
+        mediaStartTimeUs = pts
+        return true
+    }
+    // 后续帧：mediaElapsed ≈ 33ms, wallElapsed ≈ 0ms → 永远不满足
+    return mediaElapsed <= wallElapsed + 30_000
+}
+
+// 修复后：首帧立即渲染，不进入 syncFrame
+if (!firstFrameRendered && info.size > 0) {
+    codec.releaseOutputBuffer(outIdx, true)  // 立即渲染
+    firstFrameRendered = true
+    mediaStartTimeUs = info.presentationTimeUs
+    wallStartTimeUs = System.nanoTime() / 1000  // 渲染后才设基准
+    continue  // 跳过后续 sync 逻辑
+}
+// 后续帧：wallElapsed 已正常递增，sync 正确
+```
+
+### 经验教训
+
+- AudioTrack 只接受 PCM 数据，压缩格式（AAC/MP3）必须经过 MediaCodec 解码
+- 音视频播放器需要完整的音频解码管线：Extractor → MediaCodec → AudioTrack
+- PTS 同步基准必须在首帧渲染**之后**设置，不能在渲染之前就设为当前时间
+- 首帧应该无条件立即渲染，降低用户感知的启动延迟

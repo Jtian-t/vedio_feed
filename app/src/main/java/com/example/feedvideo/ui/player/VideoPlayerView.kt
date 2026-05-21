@@ -35,9 +35,11 @@ fun VideoPlayerView(
     }
 
     // 非当前视频时释放资源
-    LaunchedEffect(isCurrentVideo) {
-        if (!isCurrentVideo) {
-            player.release()
+    DisposableEffect(isCurrentVideo) {
+        onDispose {
+            if (isCurrentVideo) {
+                player.release()
+            }
         }
     }
 
