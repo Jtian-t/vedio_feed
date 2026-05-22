@@ -1,22 +1,27 @@
 package com.example.feedvideo.ui.feed
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.feedvideo.data.model.Video
 import com.example.feedvideo.data.repository.VideoRepository
 import com.example.feedvideo.player.PreloadManager
 import com.example.feedvideo.player.VideoPlayer
+import com.example.feedvideo.FeedVideoApp
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 /**
  * Feed 列表 ViewModel — 管理视频列表状态、播放控制、预加载。
  */
-class FeedViewModel : ViewModel() {
+class FeedViewModel(application: Application) : AndroidViewModel(application) {
 
     val repository = VideoRepository()
-    val player = VideoPlayer()
+    val player = VideoPlayer(application)
     val preloadManager = PreloadManager()
+    
+    // 使用全局单例代理
+    val videoProxy = (application as FeedVideoApp).videoProxy
 
     val videos: StateFlow<List<Video>> = repository.videos
 

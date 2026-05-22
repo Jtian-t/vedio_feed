@@ -75,6 +75,13 @@ class PreloadManager {
             try {
                 Log.d(TAG, "Preloading: ${video.title}")
 
+                // 跳过本地 asset（无需预加载）
+                if (video.url.startsWith("file:///android_asset/")) {
+                    preloadedUrls.add(video.url)
+                    Log.d(TAG, "Skipping preload for local asset: ${video.title}")
+                    return@launch
+                }
+
                 val request = Request.Builder()
                     .url(video.url)
                     .header("Range", "bytes=0-${PRELOAD_BYTES - 1}")

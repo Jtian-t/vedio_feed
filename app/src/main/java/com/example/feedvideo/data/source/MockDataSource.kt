@@ -4,43 +4,46 @@ import com.example.feedvideo.data.model.Video
 import kotlinx.coroutines.delay
 
 /**
- * Mock 数据源，提供 120+ 视频 URL，支持分页加载。
- * 全部使用已验证可直接访问的公开 MP4 视频源。
+ * Mock 数据源，提供视频 URL，支持分页加载。
+ *
+ * 数据源优先级：
+ * 1. 本地 asset（零网络依赖，100% 可用）
+ * 2. 验证过的 HTTPS CDN 源
  */
 object MockDataSource {
 
-    // 已验证可用的 MP4 视频 URL（全球 CDN / 国内可访问）
+    // 数据源列表 — 第一个为本地 asset（零网络依赖）
     private val videoUrls = listOf(
-        "https://media.w3.org/2010/05/sintel/trailer.mp4",                        // 4.2MB 动画预告片
-        "https://media.w3.org/2010/05/bunny/trailer.mp4",                          // 10.5MB 兔子动画
-        "https://media.w3.org/2010/05/video/movie_300.mp4",                        // 2.6MB 经典短片
-        "https://vjs.zencdn.net/v/oceans.mp4",                                     // 22MB 海洋风光
-        "https://www.w3schools.com/html/mov_bbb.mp4",                              // 770KB 兔子短片
+        "file:///android_asset/test_video.mp4",                                          // 本地 asset，770KB，零网络依赖
+        "https://www.w3schools.com/html/mov_bbb.mp4",                                    // 770KB 兔子短片
+        "https://media.w3.org/2010/05/sintel/trailer.mp4",                               // 4.2MB 动画预告片
+        "https://media.w3.org/2010/05/bunny/trailer.mp4",                                // 10.5MB 兔子动画
+        "https://media.w3.org/2010/05/video/movie_300.mp4",                              // 2.6MB 经典短片
         "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",   // 1MB 360p
         "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_2MB.mp4",   // 1.9MB 720p
-        "https://res.cloudinary.com/demo/video/upload/dog.mp4",                    // 8.7MB 宠物视频
+        "https://vjs.zencdn.net/v/oceans.mp4",                                           // 22MB 海洋风光
     )
 
     private val titles = listOf(
+        "本地测试视频",
+        "趣味短片",
         "奇幻冒险之旅",
         "春天的故事",
         "经典动画回顾",
-        "深海探秘",
-        "趣味短片",
         "快乐时光",
         "精彩瞬间",
-        "萌宠日常",
+        "深海探秘",
     )
 
     private val authors = listOf(
+        "本地资源",
+        "趣味生活",
         "动画工坊",
         "自然纪录",
         "经典影视",
-        "海洋探索",
-        "趣味生活",
         "快乐分享",
         "影像日记",
-        "萌宠频道",
+        "海洋探索",
     )
 
     // 生成 120 条 mock 数据（循环使用 URL）

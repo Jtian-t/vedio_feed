@@ -5,6 +5,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -15,11 +16,6 @@ import com.example.feedvideo.player.VideoPlayer
 
 /**
  * 全屏视频播放 Composable。
- *
- * 生命周期管理：
- * - key(videoUrl) 确保 URL 变化时彻底重建 SurfaceView
- * - DisposableEffect(isCurrentVideo) 处理滑动切换时的资源释放
- * - surfaceCreated 触发播放，surfaceDestroyed 仅打日志（资源由 DisposableEffect 释放）
  */
 @Composable
 fun VideoPlayerView(
@@ -28,6 +24,8 @@ fun VideoPlayerView(
     isCurrentVideo: Boolean,
     modifier: Modifier = Modifier
 ) {
+    val videoSize by player.videoSize.collectAsState()
+
     // 使用 videoUrl 作为 key，URL 变化时彻底重组，创建新的 SurfaceView
     key(videoUrl) {
         Box(
@@ -41,22 +39,28 @@ fun VideoPlayerView(
                     SurfaceView(context).apply {
                         holder.addCallback(object : SurfaceHolder.Callback {
                             override fun surfaceCreated(holder: SurfaceHolder) {
-                                Log.d("VideoPlayerView", "surfaceCreated: $videoUrl")
+                                Log.i("VideoPlayerView", "surfaceCreated | isCurrent=$isCurrentVideo | url=$videoUrl | surface=${holder.surface}")
                                 if (isCurrentVideo) {
+                                    Log.i("VideoPlayerView", "Calling prepareAndPlay for: $videoUrl")
                                     player.prepareAndPlay(videoUrl, holder.surface)
                                 }
                             }
 
-                            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+                            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                                Log.d("VideoPlayerView", "surfaceChanged: ${width}x${height}")
+                            }
 
                             override fun surfaceDestroyed(holder: SurfaceHolder) {
                                 Log.d("VideoPlayerView", "surfaceDestroyed: $videoUrl")
-                                // 不在此处调 release()，由 DisposableEffect 统一管理
                             }
                         })
                     }
                 },
-                modifier = Modifier.fillMaxSize()
+                modifier = if (videoSize.first > 0 && videoSize.second > 0) {
+                    Modifier.aspectRatio(videoSize.first.toFloat() / videoSize.second.toFloat())
+                } else {
+                    Modifier.fillMaxSize()
+                }
             )
         }
     }
@@ -64,11 +68,11 @@ fun VideoPlayerView(
     // 当该条目不再是当前播放项时，释放资源
     DisposableEffect(isCurrentVideo) {
         if (!isCurrentVideo) {
-            Log.d("VideoPlayerView", "Not current video, releasing: $videoUrl")
+            Log.d("VideoPlayerView", "onEffect: isCurrentVideo=false, releasing player | url=$videoUrl")
             player.release()
         }
         onDispose {
-            Log.d("VideoPlayerView", "onDispose, releasing: $videoUrl")
+            Log.d("VideoPlayerView", "onDispose: releasing player | url=$videoUrl")
             player.release()
         }
     }

@@ -9,6 +9,9 @@
 - [Bug #5: 无声音 + 画面卡顿 + 切换视频黑屏](#bug-5-无声音--画面卡顿--切换视频黑屏)
 - [Bug #6: 视频画面黑屏 + 切换视频无法加载（release/prepare 时序竞争）](#bug-6-视频画面黑屏--切换视频无法加载releaseprepare-时序竞争)
 - [Bug #7: 音频卡顿 + 音画不同步](#bug-7-音频卡顿--音画不同步)
+- [Bug #8: Android 9+ 禁止明文 HTTP 导致视频无法播放](#bug-8-android-9-禁止明文-http-导致视频无法播放)
+- [Bug #9: release() 与 decode loop 竞争 MediaCodec 导致 IllegalStateException](#bug-9-release-与-decode-loop-竞争-mediacodec-导致-illegalstateexception)
+- [Bug #10: Asset 双 Extractor 共享 FD + 缺少防御性检查导致播放失败](#bug-10-asset-双-extractor-共享-fd--缺少防御性检查导致播放失败)
 
 ---
 
@@ -454,7 +457,7 @@ while (gen == currentGen) { ... }  // 旧 loop 自然退出
 
 - **日期**: 2026-05-22
 - **严重程度**: 中
-- **状态**: 待修复
+- **状态**: 已修复
 
 ### 现象
 
@@ -479,3 +482,258 @@ while (gen == currentGen) { ... }  // 旧 loop 自然退出
 - Android AudioTrack 官方文档建议 MODE_STREAM 缓冲区至少为 `getMinBufferSize()` 的两倍
 - ExoPlayer 使用音频 PTS + getPlaybackHeadPosition() 实现 A/V sync
 - IJKPlayer 使用音视频 PTS 差值做同步判断
+
+---
+
+## Bug #8: Android 9+ 禁止明文 HTTP 导致视频无法播放
+
+- **日期**: 2026-05-22
+- **严重程度**: 高（致命）
+- **状态**: 已修复
+
+### 现象
+
+应用 UI 正常显示（标题、作者、点赞按钮等），但视频区域始终为黑色，无任何视频画面。上下滑动切换视频，所有视频均为黑屏。Logcat 中 MediaExtractor 报错但不易察觉。
+
+### 排查过程
+
+1. ~~检查播放流程~~ — `prepareAndPlay()` 逻辑正确，Bug #1 的修复已生效
+2. ~~检查视频 URL~~ — 所有 mock URL 经 curl 验证均返回 200 OK
+3. ~~检查代理服务器~~ — `VideoProxy.start()` 正常启动，端口正常绑定
+4. ~~检查 MediaExtractor 调用~~ — `setDataSource(proxyUrl)` 中 proxyUrl 格式为 `http://127.0.0.1:PORT/proxy?url=...`
+5. **发现问题** — `AndroidManifest.xml` 中**缺少** `android:usesCleartextTraffic="true"` 和 `android:networkSecurityConfig`
+6. **确认根因** — Android 9 (API 28) 起默认禁止明文 HTTP 流量。`MediaExtractor` 使用原生 HTTP 客户端，不受应用层 Java HTTP 库的异常处理覆盖，连接 `http://127.0.0.1:PORT` 被系统静默拒绝
+
+### 根因
+
+**Android 9+ (API 28) 默认禁止明文 HTTP 通信**。项目中本地视频代理运行在 `http://127.0.0.1:<PORT>`，使用的是明文 HTTP 协议。`MediaExtractor.setDataSource()` 在底层调用原生 `MediaHTTPConnection`（基于 libcurl），该原生 HTTP 客户端受 Android 网络安全策略约束：
+
+- 应用 targetSdk=34，minSdk=26
+- 在 API 28+ 设备/模拟器上，默认网络安全策略**禁止所有明文 HTTP**
+- `MediaExtractor` 尝试连接 `http://127.0.0.1:PORT` → 被系统拦截 → `setDataSource()` 失败
+- 失败后 `videoExtractor.trackCount` 为 0 → 进入 "No video track found" → state = ERROR → 黑屏
+
+与 Bug #1 的区别：Bug #1 是 prepare/play 流程断裂（代码逻辑问题），本 Bug 是网络策略问题（系统安全策略拦截了 HTTP 连接）。
+
+### 修复方案
+
+1. **创建网络安全配置文件** `res/xml/network_security_config.xml`：
+```xml
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>
+```
+
+2. **更新 AndroidManifest.xml**：
+```xml
+<application
+    android:usesCleartextTraffic="true"
+    android:networkSecurityConfig="@xml/network_security_config"
+    ...>
+```
+
+3. **修复 VideoProxy HTTP 协议问题**（附带修复）：
+   - `serveContent()` 中当上游返回 200 OK 时，不再错误发送 Content-Range 头
+   - 上游请求添加 `User-Agent` 和 `Accept` 头，避免 CDN 拒绝无头请求
+   - 缓存逻辑修正：仅对非 Range 请求的结果进行缓存
+
+### 经验教训
+
+- Android 9+ 的网络安全策略会影响**所有**网络客户端，包括原生层的 `MediaExtractor`
+- 本地 HTTP 代理方案必须在 `network_security_config.xml` 中显式允许 localhost 明文通信
+- `android:usesCleartextTraffic="true"` 全局允许 + `networkSecurityConfig` 域名级允许 双保险
+- 原生组件（MediaCodec/MediaExtractor）的网络访问不受 Java 层 try-catch 保护，失败可能表现为静默错误
+
+---
+
+## Bug #9: release() 与 decode loop 竞争 MediaCodec 导致 IllegalStateException
+
+- **日期**: 2026-05-22
+- **严重程度**: 高
+- **状态**: 已修复
+
+### 现象
+
+修复 Bug #8 后，本地 asset 视频可以成功通过代理加载（日志显示 "Asset full: 770857 bytes, Transfer complete"），但随即报错：
+```
+Playback error [seq=2]: IllegalStateException (codec2)
+```
+视频仍然黑屏，无画面渲染。
+
+### 排查过程
+
+1. ~~检查代理~~ — 代理正常工作，asset 文件成功读取 770,857 bytes
+2. ~~检查 MediaExtractor~~ — `setDataSource` 成功完成
+3. **发现时序问题** — 日志显示请求完成 200ms 后即触发 `Manual release, currentSeq=3`，又过了 568ms 才报 `IllegalStateException`
+4. **确认竞态** — `release()` 同步执行：递增 seq → `cancel()` 协程 → 旧协程 `finally` 块调用 `codec.stop()/release()`。但此时新的 decode loop 可能已经启动，正在使用同一个 codec2 实例
+5. **codec2 敏感性** — Android 12+ 的 codec2 实现对并发操作（stop/release 同时 decode）比旧版 MediaCodec 更敏感，会抛出 `IllegalStateException`
+
+### 根因
+
+**`release()` 与 decode loop 的 MediaCodec 竞争**。时序如下：
+
+```
+时间线：
+t0: prepareAndPlay(seq=2) 启动 → codec.start() → decode loop 运行中
+t1: release() 被调用 → seq 变为 3 → cancel(旧协程)
+t2: 旧协程 finally 块 → codec.stop() → codec.release()
+t3: prepareAndPlay(seq=3) 启动 → 创建新 codec → codec.start()
+    但 t2 和 t3 可能重叠：旧 codec.stop() 正在执行时，新 codec 开始配置
+```
+
+问题根源：
+1. `release()` 是同步的，不等待旧协程退出
+2. `finally` 块中的 `codec.stop()` 可能在新 decode loop 使用 codec 时执行
+3. codec2（Android 12+）对这种竞态更敏感，直接抛 `IllegalStateException`
+
+### 修复方案
+
+1. **后台清理协程**：将 `finally` 块中的资源释放改为提交到独立的 `cleanupJob`，延迟 100ms 后执行，确保新的 decode loop 已经启动
+2. **decode loop 容错**：在 `videoDecodeLoop` 和 `audioDecodeLoop` 中添加 `try-catch(IllegalStateException)`，codec 被后台清理时安全退出
+3. **Volatile 标注**：`activeAudioTrack` 和 `audioSampleRate` 添加 `@Volatile` 确保多线程可见性
+
+```kotlin
+// 修复前：finally 直接释放 codec（可能和新 decode loop 竞争）
+finally {
+    vCodec?.safeRelease()  // ← codec.stop() 可能导致 IllegalStateException
+    aCodec?.safeRelease()
+}
+
+// 修复后：后台协程延迟释放
+finally {
+    cleanupJob = scope.launch {
+        delay(100)  // 等待新 decode loop 先启动
+        try { vc?.stop() } catch (_: Exception) {}
+        try { vc?.release() } catch (_: Exception) {}
+        // ...
+    }
+}
+```
+
+### 经验教训
+
+- MediaCodec（特别是 codec2）不支持并发的 stop/release + decode 操作
+- `release()` 协程 cancel 后的 `finally` 块可能和新协程的 codec 操作重叠
+- 后台清理 + 延迟释放 + decode loop 容错 = 三重保护
+- `@Volatile` 在多线程 codec 场景下是必要的，不能依赖 AtomicReference 或 synchronized
+
+---
+
+## Bug #10: Asset 双 Extractor 共享 FD + 缺少防御性检查导致播放失败
+
+- **日期**: 2026-05-22
+- **严重程度**: 高（致命）
+- **状态**: 已修复
+
+### 现象
+
+所有视频（包括本地 asset）均无法播放，黑屏。Logcat 报错：
+```
+setDataSource FAILED for asset: test_video.mp4
+Playback error [seq=2]: IllegalStateException (no message)
+```
+
+### 排查过程
+
+1. ~~检查 asset 文件~~ — 文件存在（991KB），`file` 命令确认为标准 ISO Media/MP4
+2. ~~检查 openFd~~ — 日志显示 `Asset fd: offset=0, length=991017`，openFd 成功
+3. **发现问题** — 两个 MediaExtractor 共享同一个 `AssetFileDescriptor.fileDescriptor`：
+   ```kotlin
+   videoExtractor.setDataSource(fd, offset, length)  // 第一个 OK
+   audioExtractor.setDataSource(fd, offset, length)  // 失败！共享 fd 读取位置冲突
+   ```
+4. **确认根因** — AssetFileDescriptor 的 fd 是共享的，两个 MediaExtractor 实例各自独立 seek 时互相干扰，第二个 `setDataSource` 失败
+5. **附带问题** — 缺少 `surface.isValid` 检查、缺少 `trackCount == 0` 防御、视频尺寸无安全提取
+
+### 根因
+
+**两个 MediaExtractor 共享同一个 AssetFileDescriptor 的 fd**。`AssetFileDescriptor.fileDescriptor` 返回的是底层文件描述符，两个 MediaExtractor 同时对其调用 `setDataSource(fd, offset, length)` 时，它们共享文件偏移指针。第一个 extractor 正常初始化并 seek 到某个位置后，第二个 extractor 的初始化过程会受到干扰，导致 `setDataSource` 抛出异常。
+
+此外缺少多项防御性检查：
+- `surface.isValid` 未检查 → Surface 已销毁时 configure 崩溃
+- `trackCount == 0` 未检查 → 不支持的文件格式导致空指针
+- `KEY_DURATION` / `KEY_WIDTH` / `KEY_HEIGHT` 直接读取 → 某些文件缺少这些字段时崩溃
+
+### 修复方案
+
+**核心修复：Asset 复制到临时文件**
+
+```kotlin
+// 修复前：共享 fd
+val fd = assetFd.fileDescriptor
+videoExtractor.setDataSource(fd, offset, length)  // OK
+audioExtractor.setDataSource(fd, offset, length)  // FAIL!
+
+// 修复后：复制到临时文件，各自独立加载
+val tempFile = copyAssetToTemp(assetPath)
+videoExtractor.setDataSource(tempFile.absolutePath)  // 独立
+audioExtractor.setDataSource(tempFile.absolutePath)  // 独立
+```
+
+**防御性检查**
+
+```kotlin
+// 1. Surface 有效性检查
+if (!surface.isValid) {
+    Log.e(TAG, "Surface is already invalid, aborting configure")
+    return@launch
+}
+
+// 2. trackCount 检查
+if (videoExtractor.trackCount == 0) {
+    Log.e(TAG, "MediaExtractor has 0 tracks! File may be corrupted.")
+    return@launch
+}
+
+// 3. 安全的格式字段读取
+_duration.value = try { videoFormat.getLong(KEY_DURATION) / 1000 } catch (_: Exception) { 0L }
+val width = if (videoFormat.containsKey(KEY_WIDTH)) videoFormat.getInteger(KEY_WIDTH) else 0
+val height = if (videoFormat.containsKey(KEY_HEIGHT)) videoFormat.getInteger(KEY_HEIGHT) else 0
+```
+
+**视频尺寸暴露 + 自适应比例**
+
+```kotlin
+// VideoPlayer: 暴露视频尺寸
+private val _videoSize = MutableStateFlow(Pair(0, 0))
+val videoSize: StateFlow<Pair<Int, Int>> = _videoSize
+
+// VideoPlayerView: 根据视频尺寸调整 SurfaceView 比例
+val videoSize by player.videoSize.collectAsState()
+modifier = if (videoSize.first > 0 && videoSize.second > 0) {
+    Modifier.aspectRatio(videoSize.first.toFloat() / videoSize.second.toFloat())
+} else {
+    Modifier.fillMaxSize()
+}
+```
+
+**网络 URL 恢复代理路径**
+
+```kotlin
+// FeedScreen: 网络 URL 走代理（缓存 + 流式），本地 Asset 直接传给 Player
+val proxyUrl = if (video.url.startsWith("file:///android_asset/")) {
+    video.url  // Asset 由 Player 内部处理
+} else {
+    viewModel.videoProxy.getProxyUrl(video.url)  // 网络 URL 走代理
+}
+```
+
+### 经验教训
+
+- `AssetFileDescriptor.fileDescriptor` 返回的 fd 是共享的，多个 MediaExtractor 不能共享同一个 fd
+- Asset 文件应先复制到临时文件再由 MediaExtractor 加载，避免 fd 共享问题
+- MediaCodec 全链路需要防御性检查：Surface 有效性、trackCount、格式字段安全性
+- 视频播放器应暴露视频尺寸，UI 层根据实际尺寸自适应渲染比例
+- 代理架构对网络 URL 仍有价值（缓存 + Range 支持），不应完全移除
+
+### 里程碑
+
+本 Bug 修复标志着 **V1 基础播放版本** 完成：
+- 本地 Asset 视频可正常播放（音画同步）
+- 网络 HTTPS 视频可正常播放（通过代理）
+- 视频尺寸自适应，画面不变形
+- 滑动切换视频可正常工作
+- 防御性检查覆盖主要崩溃路径

@@ -4,6 +4,7 @@ import android.util.Log
 import okhttp3.Interceptor
 import okhttp3.Response
 import okio.Buffer
+import okio.buffer
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -26,37 +27,49 @@ class BandwidthInterceptor : Interceptor {
         val startTime = System.nanoTime()
 
         val response = chain.proceed(request)
+        val body = response.body ?: return response
 
-        // 计算下载速度
-        val responseBody = response.body ?: return response
-        val contentLength = responseBody.contentLength()
+        // 使用自定义 ResponseBody 包装，在读取流的过程中动态计算速度，避免阻塞
+        val wrappedBody = object : okhttp3.ResponseBody() {
+            override fun contentType() = body.contentType()
+            override fun contentLength() = body.contentLength()
+            override fun source(): okio.BufferedSource {
+                val source = body.source()
+                return object : okio.ForwardingSource(source) {
+                    var totalBytesRead = 0L
 
-        if (contentLength > 0) {
-            val source = responseBody.source()
-            source.request(Long.MAX_VALUE) // 确保数据加载完毕
-            val buffer = source.buffer
-            val bytesRead = buffer.size
-
-            val durationMs = (System.nanoTime() - startTime) / 1_000_000.0
-            if (durationMs > 0) {
-                val instantKbps = bytesRead / 1024.0 / (durationMs / 1000.0)
-
-                // 滑动平均
-                val current = currentBandwidthKbps.get()
-                val smoothed = if (current == 0.0) {
-                    instantKbps
-                } else {
-                    current * (1 - SMOOTHING_FACTOR) + instantKbps * SMOOTHING_FACTOR
-                }
-                currentBandwidthKbps.set(smoothed)
-
-                val weak = smoothed < WEAK_NETWORK_THRESHOLD_KBPS
-                isWeakNetwork.set(weak)
-
-                Log.d(TAG, "Bandwidth: ${String.format("%.1f", smoothed)} KB/s, weak=$weak")
+                    override fun read(sink: okio.Buffer, byteCount: Long): Long {
+                        val bytesRead = super.read(sink, byteCount)
+                        if (bytesRead != -1L) {
+                            totalBytesRead += bytesRead
+                            
+                            val durationMs = (System.nanoTime() - startTime) / 1_000_000.0
+                            if (durationMs > 100) { // 采样周期 100ms
+                                val instantKbps = totalBytesRead / 1024.0 / (durationMs / 1000.0)
+                                updateBandwidth(instantKbps)
+                            }
+                        }
+                        return bytesRead
+                    }
+                }.buffer()
             }
         }
 
-        return response
+        return response.newBuilder().body(wrappedBody).build()
+    }
+
+    private fun updateBandwidth(instantKbps: Double) {
+        val current = currentBandwidthKbps.get()
+        val smoothed = if (current == 0.0) {
+            instantKbps
+        } else {
+            current * (1 - SMOOTHING_FACTOR) + instantKbps * SMOOTHING_FACTOR
+        }
+        currentBandwidthKbps.set(smoothed)
+
+        val weak = smoothed < WEAK_NETWORK_THRESHOLD_KBPS
+        isWeakNetwork.set(weak)
+        
+        Log.v(TAG, "Current Bandwidth: ${String.format("%.1f", smoothed)} KB/s")
     }
 }
