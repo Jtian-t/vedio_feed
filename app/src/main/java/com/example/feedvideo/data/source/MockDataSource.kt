@@ -4,33 +4,43 @@ import com.example.feedvideo.data.model.Video
 import kotlinx.coroutines.delay
 
 /**
- * Mock 数据源，提供 100+ 视频 URL，支持分页加载。
- * 使用公开可访问的 MP4 视频源。
+ * Mock 数据源，提供 120+ 视频 URL，支持分页加载。
+ * 全部使用已验证可直接访问的公开 MP4 视频源。
  */
 object MockDataSource {
 
-    // 公开可访问的 MP4 视频 URL 列表（已验证可用）
+    // 已验证可用的 MP4 视频 URL（全球 CDN / 国内可访问）
     private val videoUrls = listOf(
-        "https://media.w3.org/2010/05/sintel/trailer.mp4",       // Sintel 预告片
-        "https://media.w3.org/2010/05/bunny/trailer.mp4",         // Bunny 预告片
-        "https://media.w3.org/2010/05/video/movie_300.mp4",       // W3C 测试视频
-        "https://vjs.zencdn.net/v/oceans.mp4",                    // Oceans
-        "https://www.w3schools.com/html/mov_bbb.mp4",             // Big Buck Bunny 短片
-        "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4",
+        "https://media.w3.org/2010/05/sintel/trailer.mp4",                        // 4.2MB 动画预告片
+        "https://media.w3.org/2010/05/bunny/trailer.mp4",                          // 10.5MB 兔子动画
+        "https://media.w3.org/2010/05/video/movie_300.mp4",                        // 2.6MB 经典短片
+        "https://vjs.zencdn.net/v/oceans.mp4",                                     // 22MB 海洋风光
+        "https://www.w3schools.com/html/mov_bbb.mp4",                              // 770KB 兔子短片
+        "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",   // 1MB 360p
+        "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_2MB.mp4",   // 1.9MB 720p
+        "https://res.cloudinary.com/demo/video/upload/dog.mp4",                    // 8.7MB 宠物视频
     )
 
     private val titles = listOf(
-        "辛特尔的传说",
-        "兔子的春天",
-        "W3C 测试视频",
-        "海洋世界",
-        "大兔子短片",
-        "Blender 动画",
+        "奇幻冒险之旅",
+        "春天的故事",
+        "经典动画回顾",
+        "深海探秘",
+        "趣味短片",
+        "快乐时光",
+        "精彩瞬间",
+        "萌宠日常",
     )
 
     private val authors = listOf(
-        "Blender Foundation", "Blender Foundation", "W3C",
-        "VideoJS", "W3Schools", "Blender"
+        "动画工坊",
+        "自然纪录",
+        "经典影视",
+        "海洋探索",
+        "趣味生活",
+        "快乐分享",
+        "影像日记",
+        "萌宠频道",
     )
 
     // 生成 120 条 mock 数据（循环使用 URL）
@@ -56,9 +66,6 @@ object MockDataSource {
      * @return Pair<videos, hasMore>
      */
     suspend fun loadVideos(page: Int = 0): Pair<List<Video>, Boolean> {
-        // 模拟网络延迟
-        delay(300L)
-
         val startIndex = page * PAGE_SIZE
         if (startIndex >= allVideos.size) {
             return emptyList<Video>() to false
@@ -76,7 +83,6 @@ object MockDataSource {
      */
     suspend fun refresh(): Pair<List<Video>, Boolean> {
         delay(500L)
-        // 返回第一批数据，模拟刷新
         return allVideos.take(PAGE_SIZE) to true
     }
 }
