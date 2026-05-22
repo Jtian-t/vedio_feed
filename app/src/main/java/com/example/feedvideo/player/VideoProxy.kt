@@ -31,7 +31,7 @@ class VideoProxy(private val context: Context) {
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
     private val isRunning = AtomicBoolean(false)
-    private val cacheManager = CacheManager()
+    val cacheManager = CacheManager()
     private var actualPort = 0
 
     val proxyUrl: String
@@ -172,86 +172,138 @@ class VideoProxy(private val context: Context) {
     ) {
         // 尝试从缓存获取（仅完整请求）
         if (cacheManager.isCached(url) && rangeStart == 0L && !isRangeRequest) {
-            val cachedData = cacheManager.get(url)
-            if (cachedData != null) {
-                Log.i(TAG, "Cache HIT: $url, size=${cachedData.size} bytes")
-                sendResponse(output, cachedData, "video/mp4", false)
-                return
-            }
-            Log.d(TAG, "Cache MISS (isCached=true but get returned null): $url")
-        } else if (!isRangeRequest && rangeStart == 0L) {
-            Log.d(TAG, "Cache MISS: $url")
-        }
-
-        // 从网络获取并流式传输
-        val request = Request.Builder()
-            .url(url)
-            .header("User-Agent", "FeedVideo/1.0")
-            .header("Accept", "*/*")
-            .apply { if (rangeStart > 0) addHeader("Range", "bytes=$rangeStart-") }
-            .build()
-
-        try {
-            NetworkClient.client.newCall(request).execute().use { response ->
-                val body = response.body ?: run {
-                    Log.e(TAG, "Upstream returned null body for: $url")
-                    sendError(output, 502, "Bad Gateway")
-                    return
-                }
-                val contentType = body.contentType()?.toString() ?: "video/mp4"
-                val contentLength = body.contentLength()
-
-                Log.d(TAG, "<<< Upstream: HTTP ${response.code} | Content-Length=$contentLength | Content-Type=$contentType | URL=$url")
-
-                // 根据上游实际响应码决定状态行
-                val upstreamSupportsRange = response.code == 206
-                val statusLine = if (upstreamSupportsRange) {
-                    "HTTP/1.1 206 Partial Content\r\n"
-                } else {
-                    "HTTP/1.1 200 OK\r\n"
-                }
-
-                val header = buildString {
-                    append(statusLine)
-                    append("Content-Type: $contentType\r\n")
-                    append("Content-Length: $contentLength\r\n")
-                    append("Accept-Ranges: bytes\r\n")
-                    if (upstreamSupportsRange) {
-                        response.header("Content-Range")?.let { cr ->
-                            append("Content-Range: $cr\r\n")
-                        }
+            val cacheFile = cacheManager.diskCache.getFile(cacheManager.diskCache.cacheKey(url))
+            if (cacheFile.exists() && cacheFile.length() > 0) {
+                Log.i(TAG, "Cache HIT (File): $url, size=${cacheFile.length()} bytes")
+                try {
+                    val header = buildString {
+                        append("HTTP/1.1 200 OK\r\n")
+                        append("Content-Type: video/mp4\r\n")
+                        append("Content-Length: ${cacheFile.length()}\r\n")
+                        append("Accept-Ranges: bytes\r\n")
+                        append("Connection: close\r\n\r\n")
                     }
-                    append("Connection: close\r\n\r\n")
-                }
-
-                output.write(header.toByteArray())
-
-                val source = body.source()
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                var totalStreamed = 0L
-                // 仅对小文件（<5MB）缓存，大文件纯流式避免 OOM
-                val cacheStream = if (rangeStart == 0L && !isRangeRequest && contentLength in 1..(5 * 1024 * 1024)) ByteArrayOutputStream() else null
-
-                while (source.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                    output.flush()
-                    cacheStream?.write(buffer, 0, bytesRead)
-                    totalStreamed += bytesRead
-                }
-
-                Log.d(TAG, "Transfer complete: $totalStreamed bytes streamed | cached=${cacheStream != null} | URL=$url")
-
-                // 如果是完整请求且下载完成且文件较小，存入缓存
-                if (cacheStream != null) {
-                    val data = cacheStream.toByteArray()
-                    cacheManager.put(url, data)
-                    Log.d(TAG, "Cached: ${data.size} bytes for $url")
+                    output.write(header.toByteArray())
+                    cacheFile.inputStream().use { input ->
+                        streamData(input, output)
+                    }
+                    return
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error serving from cache file: ${e.message}")
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Network error for $url: ${e.message}")
         }
+
+        // 从网络获取并流式传输（支持网络中断后自动重连）
+        val buffer = ByteArray(8192)
+        var totalStreamed = 0L
+        var currentPosition = rangeStart
+        val shouldCache = rangeStart == 0L && !isRangeRequest
+        var headerSent = false
+        var maxRetries = 3
+
+        if (shouldCache) {
+            Log.d(TAG, "Starting incremental cache for: $url")
+        }
+
+        while (isRunning.get() && maxRetries > 0) {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", "FeedVideo/1.0")
+                    .header("Accept", "*/*")
+                    .apply { if (currentPosition > 0) addHeader("Range", "bytes=$currentPosition-") }
+                    .build()
+
+                NetworkClient.client.newCall(request).execute().use { response ->
+                    val body = response.body ?: run {
+                        Log.e(TAG, "Upstream returned null body for: $url")
+                        if (!headerSent) sendError(output, 502, "Bad Gateway")
+                        return
+                    }
+
+                    Log.d(TAG, "<<< Upstream: HTTP ${response.code} | Content-Length=${body.contentLength()} | URL=$url")
+
+                    // 重连时如果 CDN 不支持 Range，发送重复数据会导致播放器解析错误，直接放弃
+                    if (headerSent && response.code != 206) {
+                        Log.w(TAG, "Retry got HTTP ${response.code} (expected 206), CDN doesn't support Range. Stopping.")
+                        return
+                    }
+
+                    // 仅在首次连接时发送 HTTP 响应头给播放器
+                    if (!headerSent) {
+                        val contentType = body.contentType()?.toString() ?: "video/mp4"
+                        val contentLength = body.contentLength()
+                        val upstreamSupportsRange = response.code == 206
+                        val statusLine = if (upstreamSupportsRange) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n"
+                        val header = buildString {
+                            append(statusLine)
+                            append("Content-Type: $contentType\r\n")
+                            append("Content-Length: $contentLength\r\n")
+                            append("Accept-Ranges: bytes\r\n")
+                            if (upstreamSupportsRange) {
+                                response.header("Content-Range")?.let { append("Content-Range: $it\r\n") }
+                            }
+                            append("Connection: close\r\n\r\n")
+                        }
+                        output.write(header.toByteArray())
+                        headerSent = true
+                    }
+
+                    val source = body.source()
+                    var streamError = false
+
+                    // 内层流式传输循环
+                    while (isRunning.get()) {
+                        val bytesRead = try {
+                            source.read(buffer)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Upstream read error for $url: ${e.message}")
+                            streamError = true
+                            break  // 跳出内层循环，进入重连逻辑
+                        }
+
+                        if (bytesRead == -1) break  // 正常 EOF
+
+                        try {
+                            output.write(buffer, 0, bytesRead)
+                            output.flush()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Client socket write error: ${e.message}")
+                            return  // 客户端断开，无法恢复
+                        }
+
+                        if (shouldCache) {
+                            val data = if (bytesRead == buffer.size) buffer else buffer.copyOfRange(0, bytesRead)
+                            cacheManager.append(url, data)
+                        }
+
+                        currentPosition += bytesRead
+                        totalStreamed += bytesRead
+                    }
+
+                    // 内层循环正常结束（EOF），无需重连
+                    if (!streamError) {
+                        Log.d(TAG, "Transfer complete: $totalStreamed bytes streamed | URL=$url")
+                        return
+                    }
+
+                    // 网络出错，准备重连
+                    maxRetries--
+                    Log.w(TAG, "Upstream error, will retry ($maxRetries retries left) | offset=$currentPosition | URL=$url")
+                }
+            } catch (e: Exception) {
+                maxRetries--
+                Log.e(TAG, "Connection error for $url: ${e.message} | retries left=$maxRetries")
+            }
+
+            // 重连前等待
+            if (maxRetries > 0 && isRunning.get()) {
+                try { Thread.sleep(500) } catch (_: InterruptedException) {}
+            }
+        }
+
+        Log.d(TAG, "Transfer ended: $totalStreamed bytes streamed | URL=$url")
     }
 
     private fun streamData(input: InputStream, output: OutputStream) {

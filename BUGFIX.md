@@ -12,6 +12,7 @@
 - [Bug #8: Android 9+ 禁止明文 HTTP 导致视频无法播放](#bug-8-android-9-禁止明文-http-导致视频无法播放)
 - [Bug #9: release() 与 decode loop 竞争 MediaCodec 导致 IllegalStateException](#bug-9-release-与-decode-loop-竞争-mediacodec-导致-illegalstateexception)
 - [Bug #10: Asset 双 Extractor 共享 FD + 缺少防御性检查导致播放失败](#bug-10-asset-双-extractor-共享-fd--缺少防御性检查导致播放失败)
+- [Bug #11: 代理网络抖动后断开连接导致播放永久停止](#bug-11-代理网络抖动后断开连接导致播放永久停止)
 
 ---
 
@@ -737,3 +738,95 @@ val proxyUrl = if (video.url.startsWith("file:///android_asset/")) {
 - 视频尺寸自适应，画面不变形
 - 滑动切换视频可正常工作
 - 防御性检查覆盖主要崩溃路径
+
+---
+
+## Bug #11: 代理网络抖动后断开连接导致播放永久停止
+
+- **日期**: 2026-05-22
+- **严重程度**: 高
+- **状态**: 已修复
+
+### 现象
+
+视频播放过程中，如果网络发生瞬时抖动（如 WiFi 切换、信号弱），视频会卡住，且永远不会自动恢复。卡住后画面冻结，无任何报错日志。
+
+### 排查过程
+
+1. ~~检查 videoDecodeLoop~~ — 时钟重同步逻辑存在但只在有帧输出时触发，网络卡住时 `dequeueOutputBuffer` 返回 -1（TIMEOUT），根本不进入同步逻辑
+2. ~~检查 MediaExtractor~~ — MediaExtractor 通过代理读取数据，代理 socket 关闭时 MediaExtractor 收到 EOF
+3. **发现根因** — `VideoProxy.serveContent()` 中 `source.read(buffer)` 捕获异常后返回 -1 → break 退出循环 → socket 关闭 → MediaExtractor 收到 EOF → 认为文件结束 → `readSampleData` 返回 -1 → codec 收到 EOS → **播放永久停止**
+4. **确认致命性** — 即使网络在 1 秒后恢复，代理已经关闭了 socket，播放器无法感知网络恢复
+
+### 根因
+
+**代理服务器在网络异常时直接断开连接，而非尝试恢复**。`serveContent()` 的流式传输循环中：
+
+```kotlin
+// 修复前：网络出错 → break → socket 关闭 → EOF → 播放器停止
+val bytesRead = try { source.read(buffer) } catch (e: Exception) { -1 }
+if (bytesRead == -1) break  // ← 直接退出，没有重连机会
+```
+
+问题链路：
+```
+网络抖动 → OkHttp source.read() 抛 IOException
+→ catch 返回 -1 → break 退出 while 循环
+→ response.use{} 结束 → socket 关闭
+→ MediaExtractor 的 HTTP 连接收到 EOF
+→ readSampleData() 返回 -1（看起来像文件尾）
+→ codec.queueInputBuffer(EOS) → codec 输出完毕
+→ 播放器状态变为 COMPLETED → 永久停止
+```
+
+### 修复方案
+
+**外层重试循环**：网络出错时重连上游 CDN，用 Range 请求从断点继续传输。
+
+```kotlin
+// 修复后：外层重试循环 + 内层流式传输
+while (isRunning.get() && maxRetries > 0) {
+    // 用 Range 请求从 currentPosition 继续
+    val request = Request.Builder()
+        .url(url)
+        .addHeader("Range", "bytes=$currentPosition-")  // 从断点续传
+        .build()
+
+    NetworkClient.client.newCall(request).execute().use { response ->
+        // 首次连接发送 HTTP 头，重连不重复发送
+        if (!headerSent) { output.write(httpHeader); headerSent = true }
+
+        // 重连时如果 CDN 不支持 Range，放弃（避免重复数据）
+        if (headerSent && response.code != 206) { return }
+
+        val source = body.source()
+        while (isRunning.get()) {
+            val bytesRead = try { source.read(buffer) }
+                catch (e: Exception) { streamError = true; break }  // 跳出内层，进入重连
+
+            if (bytesRead == -1) break  // 正常 EOF
+            output.write(buffer, 0, bytesRead)
+            currentPosition += bytesRead
+        }
+
+        if (!streamError) return  // 正常传输完毕
+    }
+    maxRetries--
+    Thread.sleep(500)  // 等待网络恢复
+}
+```
+
+关键设计：
+- `headerSent` 标志：HTTP 响应头只发一次，重连不重复发送（否则播放器解析异常）
+- `currentPosition` 追踪：重连时用 Range 请求从断点续传
+- 重连时检查 `response.code == 206`：如果 CDN 不返回 206，说明不支持 Range，放弃重连
+- `maxRetries = 3`：最多重试 3 次，避免无限循环
+- 重连间隔 500ms：给网络恢复的时间
+
+### 经验教训
+
+- 代理服务器是 MediaExtractor 和 CDN 之间的桥梁，代理断开 = 播放器看到 EOF = 视频结束
+- 网络瞬时抖动是常态（WiFi 切换、信号弱），代理必须有重连机制
+- 重连必须用 Range 请求从断点续传，否则播放器收到重复数据
+- HTTP 响应头在整个传输过程中只能发一次，重连时不重复发送
+
