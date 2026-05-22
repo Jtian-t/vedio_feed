@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 自研视频播放器 — MediaCodec + MediaExtractor + AudioTrack。
  * 禁用 ExoPlayer/IjkPlayer，完全基于 Android 底层 API。
  *
- * 使用 generation 计数器确保 release/prepareAndPlay 的时序安全。
+ * 使用 generation 计数器 + 同步等待确保 release/prepareAndPlay 时序正确。
  */
 class VideoPlayer {
 
@@ -30,7 +30,6 @@ class VideoPlayer {
     private val _duration = MutableStateFlow(0L)
     val duration: StateFlow<Long> = _duration
 
-    // 当前播放任务的 generation，每次 prepareAndPlay 递增
     private var currentGen = 0
     private var currentJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -40,17 +39,25 @@ class VideoPlayer {
     private var mediaStartTimeUs = -1L
     private var wallStartTimeUs = -1L
 
+    /**
+     * 准备并播放视频。
+     * 内部会先取消上一个任务并同步等待其资源释放完成，再启动新任务。
+     */
     fun prepareAndPlay(url: String, surface: Surface) {
         Log.d(TAG, "prepareAndPlay: $url")
-        // 先取消上一个播放任务（同步等待完成，避免资源竞争）
+
+        // ===== 同步等待旧任务退出并释放资源 =====
+        currentGen++
         val oldJob = currentJob
         if (oldJob != null) {
             oldJob.cancel()
-            // 不等 oldJob 完成，直接开始新的
+            // 阻塞等待旧任务完成（包括 finally 中的资源释放）
+            // 这是安全的：旧 job 在 Dispatchers.Default 运行，当前在 Main
+            runBlocking { oldJob.join() }
         }
-        currentGen++
-        val gen = currentGen
         currentJob = null
+
+        val gen = currentGen
         isPaused.set(false)
         _state.value = State.PREPARING
 
@@ -149,7 +156,7 @@ class VideoPlayer {
                 }
 
             } catch (e: CancellationException) {
-                throw e // 正常取消
+                throw e // 正常取消，由 finally 清理
             } catch (e: Exception) {
                 Log.e(TAG, "prepareAndPlay failed (gen=$gen)", e)
                 if (gen == currentGen) _state.value = State.ERROR
@@ -161,6 +168,7 @@ class VideoPlayer {
                 try { videoExtractor?.release() } catch (_: Exception) {}
                 try { audioExtractor?.release() } catch (_: Exception) {}
                 try { audioTrack?.stop(); audioTrack?.release() } catch (_: Exception) {}
+                Log.d(TAG, "Cleanup done for gen=$gen")
             }
         }
     }
@@ -176,55 +184,58 @@ class VideoPlayer {
         while (!outputEOS && gen == currentGen) {
             if (isPaused.get()) { Thread.sleep(30); continue }
 
-            // 输入
-            if (!inputEOS) {
-                val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
-                if (inIdx >= 0) {
-                    val buf = codec.getInputBuffer(inIdx) ?: continue
-                    val size = ext.readSampleData(buf, 0)
-                    if (size < 0) {
-                        codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        inputEOS = true
-                    } else {
-                        codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
-                        ext.advance()
+            try {
+                // 输入
+                if (!inputEOS) {
+                    val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
+                    if (inIdx >= 0) {
+                        val buf = codec.getInputBuffer(inIdx) ?: continue
+                        val size = ext.readSampleData(buf, 0)
+                        if (size < 0) {
+                            codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputEOS = true
+                        } else {
+                            codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
+                            ext.advance()
+                        }
                     }
                 }
-            }
 
-            // 输出
-            val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
-            when {
-                outIdx >= 0 -> {
-                    val isEOS = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                    if (isEOS) outputEOS = true
+                // 输出
+                val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
+                when {
+                    outIdx >= 0 -> {
+                        val isEOS = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                        if (isEOS) outputEOS = true
 
-                    // 首帧：立即渲染
-                    if (!firstFrameRendered && info.size > 0) {
-                        codec.releaseOutputBuffer(outIdx, true)
-                        firstFrameRendered = true
-                        mediaStartTimeUs = info.presentationTimeUs
-                        wallStartTimeUs = System.nanoTime() / 1000
-                        _currentPosition.value = info.presentationTimeUs / 1000
-                        Log.d(TAG, "First frame: ${info.presentationTimeUs / 1000}ms")
-                        continue
+                        if (!firstFrameRendered && info.size > 0) {
+                            codec.releaseOutputBuffer(outIdx, true)
+                            firstFrameRendered = true
+                            mediaStartTimeUs = info.presentationTimeUs
+                            wallStartTimeUs = System.nanoTime() / 1000
+                            _currentPosition.value = info.presentationTimeUs / 1000
+                            Log.d(TAG, "First frame: ${info.presentationTimeUs / 1000}ms")
+                            continue
+                        }
+
+                        val render = info.size > 0 && shouldRender(info.presentationTimeUs)
+                        codec.releaseOutputBuffer(outIdx, render)
+                        if (info.size > 0) _currentPosition.value = info.presentationTimeUs / 1000
                     }
-
-                    // 后续帧：音视频同步
-                    val render = info.size > 0 && shouldRender(info.presentationTimeUs)
-                    codec.releaseOutputBuffer(outIdx, render)
-                    if (info.size > 0) _currentPosition.value = info.presentationTimeUs / 1000
+                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        Thread.sleep(2)
+                    }
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        Log.d(TAG, "Video format: ${codec.outputFormat}")
+                    }
                 }
-                outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                    // 没有可用输出帧，短暂让出 CPU
-                    Thread.sleep(2)
-                }
-                outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    Log.d(TAG, "Video format: ${codec.outputFormat}")
-                }
+            } catch (e: Exception) {
+                if (gen != currentGen) break // 被取消，正常退出
+                Log.e(TAG, "Video loop error (gen=$gen)", e)
+                break
             }
         }
-        Log.d(TAG, "Video loop exit (gen=$gen, outputEOS=$outputEOS, currentGen=$currentGen)")
+        Log.d(TAG, "Video loop exit (gen=$gen, currentGen=$currentGen)")
     }
 
     // ==================== 音频解码循环 ====================
@@ -237,43 +248,49 @@ class VideoPlayer {
         while (!outputEOS && gen == currentGen) {
             if (isPaused.get()) { Thread.sleep(30); continue }
 
-            // 输入
-            if (!inputEOS) {
-                val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
-                if (inIdx >= 0) {
-                    val buf = codec.getInputBuffer(inIdx) ?: continue
-                    val size = ext.readSampleData(buf, 0)
-                    if (size < 0) {
-                        codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        inputEOS = true
-                    } else {
-                        codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
-                        ext.advance()
+            try {
+                // 输入
+                if (!inputEOS) {
+                    val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
+                    if (inIdx >= 0) {
+                        val buf = codec.getInputBuffer(inIdx) ?: continue
+                        val size = ext.readSampleData(buf, 0)
+                        if (size < 0) {
+                            codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputEOS = true
+                        } else {
+                            codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
+                            ext.advance()
+                        }
                     }
                 }
-            }
 
-            // 输出：PCM → AudioTrack
-            val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
-            when {
-                outIdx >= 0 -> {
-                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputEOS = true
-                    val buf = codec.getOutputBuffer(outIdx) ?: continue
-                    if (info.size > 0) {
-                        val pcm = ByteArray(info.size)
-                        buf.position(info.offset)
-                        buf.limit(info.offset + info.size)
-                        buf.get(pcm)
-                        track.write(pcm, 0, info.size)
+                // 输出：PCM → AudioTrack
+                val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
+                when {
+                    outIdx >= 0 -> {
+                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputEOS = true
+                        val buf = codec.getOutputBuffer(outIdx) ?: continue
+                        if (info.size > 0) {
+                            val pcm = ByteArray(info.size)
+                            buf.position(info.offset)
+                            buf.limit(info.offset + info.size)
+                            buf.get(pcm)
+                            track.write(pcm, 0, info.size)
+                        }
+                        codec.releaseOutputBuffer(outIdx, false)
                     }
-                    codec.releaseOutputBuffer(outIdx, false)
+                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        Thread.sleep(2)
+                    }
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        Log.d(TAG, "Audio format: ${codec.outputFormat}")
+                    }
                 }
-                outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                    Thread.sleep(2)
-                }
-                outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    Log.d(TAG, "Audio format: ${codec.outputFormat}")
-                }
+            } catch (e: Exception) {
+                if (gen != currentGen) break
+                Log.e(TAG, "Audio loop error (gen=$gen)", e)
+                break
             }
         }
         Log.d(TAG, "Audio loop exit (gen=$gen)")
@@ -313,7 +330,6 @@ class VideoPlayer {
     }
 
     fun seekTo(positionMs: Long) {
-        // seek 需要在当前任务中处理，这里简化实现
         _currentPosition.value = positionMs
     }
 
@@ -323,8 +339,17 @@ class VideoPlayer {
 
     fun release() {
         Log.d(TAG, "Releasing (gen=$currentGen)...")
-        currentGen++ // 让所有正在运行的 loop 退出
-        currentJob?.cancel()
+        currentGen++
+        val job = currentJob
+        if (job != null) {
+            job.cancel()
+            // 等待资源释放完成（最多 2 秒）
+            try {
+                runBlocking { withTimeout(2000) { job.join() } }
+            } catch (_: TimeoutCancellationException) {
+                Log.w(TAG, "Release timeout, forcing cleanup")
+            }
+        }
         currentJob = null
         _state.value = State.IDLE
         _currentPosition.value = 0L
