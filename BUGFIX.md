@@ -8,6 +8,7 @@
 - [Bug #4: 单 Extractor 空 buffer 干扰视频解码](#bug-4-单-extractor-空-buffer-干扰视频解码)
 - [Bug #5: 无声音 + 画面卡顿 + 切换视频黑屏](#bug-5-无声音--画面卡顿--切换视频黑屏)
 - [Bug #6: 视频画面黑屏 + 切换视频无法加载（release/prepare 时序竞争）](#bug-6-视频画面黑屏--切换视频无法加载releaseprepare-时序竞争)
+- [Bug #7: 音频卡顿 + 音画不同步](#bug-7-音频卡顿--音画不同步)
 
 ---
 
@@ -446,3 +447,35 @@ while (gen == currentGen) { ... }  // 旧 loop 自然退出
 - 全局 AtomicBoolean 标志在 release/prepare 竞态下不可靠
 - Generation/Epoch 模式是处理 "取消旧任务启动新任务" 的可靠方案
 - 资源释放应该放在创建它们的协程的 finally 块中，而非外部 release() 方法
+
+---
+
+## Bug #7: 音频卡顿 + 音画不同步
+
+- **日期**: 2026-05-22
+- **严重程度**: 中
+- **状态**: 待修复
+
+### 现象
+
+视频画面正常播放，但音频有明显的卡顿/爆音现象，音画不同步。
+
+### 根因分析
+
+1. **AudioTrack 缓冲区太小**：`minBuf * 2` 在 MODE_STREAM 下不够。网络流解码速率不均匀，小缓冲区无法吸收波动，导致 `write()` 频繁阻塞，产生间隙
+2. **音频解码无节奏控制**：`decodeAudio()` 以最快速度向 AudioTrack dump PCM 数据，没有基于播放速率控制写入节奏。解码速度快于播放速率时缓冲区满 → write 阻塞 → 恢复后出现空白
+3. **视频同步未使用音频基准**：`checkPts()` 用墙钟同步视频，当有音频时应使用 `AudioTrack.getPlaybackHeadPosition()` 作为主时钟
+4. **AudioTrack 使用 ENCODING_PCM_16BIT 但 MediaCodec 输出可能是浮点**：某些 AAC 编码器输出 float PCM，写入 16-bit AudioTrack 会截断产生噪音
+
+### 修复方案
+
+1. 增大 AudioTrack 缓冲区至 `minBuf * 4`，给流式播放更多缓冲空间
+2. 音频同步使用 `AudioTrack.getPlaybackHeadPosition()` 获取已播放帧数，换算成时间
+3. 有音频时视频以音频为基准同步（master clock），无音频时回退到墙钟
+4. AudioTrack 输出格式匹配 MediaCodec 实际输出格式（float vs 16bit）
+
+### 参考
+
+- Android AudioTrack 官方文档建议 MODE_STREAM 缓冲区至少为 `getMinBufferSize()` 的两倍
+- ExoPlayer 使用音频 PTS + getPlaybackHeadPosition() 实现 A/V sync
+- IJKPlayer 使用音视频 PTS 差值做同步判断
