@@ -230,7 +230,8 @@ class VideoProxy(private val context: Context) {
                 val buffer = ByteArray(8192)
                 var bytesRead: Int
                 var totalStreamed = 0L
-                val cacheStream = if (rangeStart == 0L && !isRangeRequest) ByteArrayOutputStream() else null
+                // 仅对小文件（<5MB）缓存，大文件纯流式避免 OOM
+                val cacheStream = if (rangeStart == 0L && !isRangeRequest && contentLength in 1..(5 * 1024 * 1024)) ByteArrayOutputStream() else null
 
                 while (source.read(buffer).also { bytesRead = it } != -1) {
                     output.write(buffer, 0, bytesRead)
@@ -241,7 +242,7 @@ class VideoProxy(private val context: Context) {
 
                 Log.d(TAG, "Transfer complete: $totalStreamed bytes streamed | cached=${cacheStream != null} | URL=$url")
 
-                // 如果是完整请求且下载完成，存入缓存
+                // 如果是完整请求且下载完成且文件较小，存入缓存
                 if (cacheStream != null) {
                     val data = cacheStream.toByteArray()
                     cacheManager.put(url, data)
