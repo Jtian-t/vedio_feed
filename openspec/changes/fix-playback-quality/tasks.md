@@ -13,7 +13,7 @@
 ## 3. 播放器生命周期管理
 
 - [x] 3.1 AtomicInteger 序列号管理 prepareAndPlay/decodeLoop 生命周期
-- [x] 3.2 单 MediaExtractor + synchronized 选轨读取（避免双 extractor 竞争）
+- [x] 3.2 双 MediaExtractor（videoExtractor + audioExtractor）独立读取，避免交叉 advance 数据错乱
 - [x] 3.3 finally 块中安全释放 codec/extractor/audiotrack
 - [x] 3.4 VideoPlayerView 使用 key(videoUrl) + DisposableEffect(isCurrentVideo) 管理释放
 - [ ] 3.5 验证切换视频 0 黑屏、0 声音残留
