@@ -12,7 +12,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 自研视频播放器 — MediaCodec + MediaExtractor + AudioTrack。
  * 禁用 ExoPlayer/IjkPlayer，完全基于 Android 底层 API。
  *
- * 使用 generation 计数器 + 同步等待确保 release/prepareAndPlay 时序正确。
+ * 设计要点：
+ * - 每次 prepareAndPlay 递增 seq，旧任务通过 seq != currentSeq 自行退出
+ * - 不使用 runBlocking，所有协程在 Dispatchers.Default 上运行
+ * - 资源释放放在每个任务自己的 finally 块中
  */
 class VideoPlayer {
 
@@ -30,295 +33,278 @@ class VideoPlayer {
     private val _duration = MutableStateFlow(0L)
     val duration: StateFlow<Long> = _duration
 
-    private var currentGen = 0
-    private var currentJob: Job? = null
+    // 序列号：每次 prepareAndPlay +1，decode loop 用 seq == currentSeq 判断是否继续
+    @Volatile
+    private var currentSeq = 0
+
+    private var job: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val isPaused = AtomicBoolean(false)
 
-    // 音视频同步基准
-    private var mediaStartTimeUs = -1L
-    private var wallStartTimeUs = -1L
+    // 音视频同步
+    @Volatile
+    private var mediaStartUs = -1L
+    @Volatile
+    private var wallStartUs = -1L
 
-    /**
-     * 准备并播放视频。
-     * 内部会先取消上一个任务并同步等待其资源释放完成，再启动新任务。
-     */
     fun prepareAndPlay(url: String, surface: Surface) {
         Log.d(TAG, "prepareAndPlay: $url")
 
-        // ===== 同步等待旧任务退出并释放资源 =====
-        currentGen++
-        val oldJob = currentJob
-        if (oldJob != null) {
-            oldJob.cancel()
-            // 阻塞等待旧任务完成（包括 finally 中的资源释放）
-            // 这是安全的：旧 job 在 Dispatchers.Default 运行，当前在 Main
-            runBlocking { oldJob.join() }
-        }
-        currentJob = null
+        // 让旧任务自行退出
+        currentSeq++
+        val seq = currentSeq
+        job?.cancel()
 
-        val gen = currentGen
         isPaused.set(false)
         _state.value = State.PREPARING
 
-        currentJob = scope.launch {
-            var videoExtractor: MediaExtractor? = null
-            var audioExtractor: MediaExtractor? = null
-            var videoCodec: MediaCodec? = null
-            var audioCodec: MediaCodec? = null
-            var audioTrack: AudioTrack? = null
+        job = scope.launch {
+            // 所有资源都是局部变量，finally 负责释放
+            var vExt: MediaExtractor? = null
+            var aExt: MediaExtractor? = null
+            var vCodec: MediaCodec? = null
+            var aCodec: MediaCodec? = null
+            var aTrack: AudioTrack? = null
 
             try {
-                // ===== 1. 视频 Extractor =====
-                val vExt = MediaExtractor()
-                vExt.setDataSource(url)
-                var videoFormat: MediaFormat? = null
+                // === 1. 视频 Extractor ===
+                vExt = MediaExtractor().also { it.setDataSource(url) }
+                var vFmt: MediaFormat? = null
                 for (i in 0 until vExt.trackCount) {
-                    val fmt = vExt.getTrackFormat(i)
-                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("video/") && videoFormat == null) {
-                        videoFormat = fmt
+                    val f = vExt.getTrackFormat(i)
+                    val m = f.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (m.startsWith("video/") && vFmt == null) {
+                        vFmt = f
                         vExt.selectTrack(i)
                     }
                 }
-                if (videoFormat == null) {
-                    Log.e(TAG, "No video track in $url")
-                    if (gen == currentGen) _state.value = State.ERROR
+                if (vFmt == null) {
+                    Log.e(TAG, "No video track: $url")
+                    if (seq == currentSeq) _state.value = State.ERROR
                     return@launch
                 }
                 if (!isActive) return@launch
-                videoExtractor = vExt
-                _duration.value = videoFormat.getLong(MediaFormat.KEY_DURATION) / 1000
-                Log.d(TAG, "Video: duration=${_duration.value}ms")
+                _duration.value = vFmt.getLong(MediaFormat.KEY_DURATION) / 1000
 
-                // ===== 2. 视频 Codec =====
-                val videoMime = videoFormat.getString(MediaFormat.KEY_MIME)!!
-                videoCodec = MediaCodec.createDecoderByType(videoMime).apply {
-                    configure(videoFormat, surface, null, 0)
-                    start()
+                // === 2. 视频 Codec ===
+                val vMime = vFmt.getString(MediaFormat.KEY_MIME)!!
+                vCodec = MediaCodec.createDecoderByType(vMime).also {
+                    it.configure(vFmt, surface, null, 0)
+                    it.start()
                 }
-                Log.d(TAG, "Video codec: $videoMime")
+                Log.d(TAG, "Video codec: $vMime, duration=${_duration.value}ms")
 
-                // ===== 3. 音频 Extractor + Codec =====
-                val aExt = MediaExtractor()
-                aExt.setDataSource(url)
-                var audioFormat: MediaFormat? = null
+                // === 3. 音频 ===
+                aExt = MediaExtractor().also { it.setDataSource(url) }
+                var aFmt: MediaFormat? = null
                 for (i in 0 until aExt.trackCount) {
-                    val fmt = aExt.getTrackFormat(i)
-                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("audio/") && audioFormat == null) {
-                        audioFormat = fmt
+                    val f = aExt.getTrackFormat(i)
+                    val m = f.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (m.startsWith("audio/") && aFmt == null) {
+                        aFmt = f
                         aExt.selectTrack(i)
                     }
                 }
-                if (audioFormat != null) {
-                    audioExtractor = aExt
+                if (aFmt != null) {
                     try {
-                        val mime = audioFormat.getString(MediaFormat.KEY_MIME) ?: ""
-                        val sampleRate = audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        val channelCount = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        val channelConfig = if (channelCount == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
-                        val minBuf = AudioTrack.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT)
-                        audioTrack = AudioTrack(
-                            AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                        val aMime = aFmt.getString(MediaFormat.KEY_MIME) ?: ""
+                        val sr = aFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        val ch = aFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        val cfg = if (ch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+                        val buf = AudioTrack.getMinBufferSize(sr, cfg, AudioFormat.ENCODING_PCM_16BIT)
+                        aTrack = AudioTrack(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
                                 .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build(),
-                            AudioFormat.Builder().setSampleRate(sampleRate)
-                                .setChannelMask(channelConfig)
+                            AudioFormat.Builder()
+                                .setSampleRate(sr).setChannelMask(cfg)
                                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build(),
-                            minBuf * 2, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE
+                            buf * 2, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE
                         )
-                        audioTrack?.play()
-                        audioCodec = MediaCodec.createDecoderByType(mime).apply {
-                            configure(audioFormat, null, null, 0)
-                            start()
+                        aTrack?.play()
+                        aCodec = MediaCodec.createDecoderByType(aMime).also {
+                            it.configure(aFmt, null, null, 0)
+                            it.start()
                         }
-                        Log.d(TAG, "Audio pipeline: $mime ${sampleRate}Hz ${channelCount}ch")
+                        Log.d(TAG, "Audio: $aMime ${sr}Hz ${ch}ch")
                     } catch (e: Exception) {
-                        Log.w(TAG, "Audio setup failed, video-only mode", e)
+                        Log.w(TAG, "Audio setup failed", e)
                     }
                 }
 
-                if (!isActive) return@launch
-                if (gen == currentGen) _state.value = State.PLAYING
-                Log.d(TAG, "=== Starting playback (gen=$gen) ===")
+                if (!isActive || seq != currentSeq) return@launch
+                _state.value = State.PLAYING
+                Log.d(TAG, "=== Playback started (seq=$seq) ===")
 
-                // ===== 4. 并行解码 =====
-                val vJob = launch { videoLoop(videoExtractor!!, videoCodec!!, gen) }
-                val aJob = if (audioExtractor != null && audioCodec != null && audioTrack != null) {
-                    launch { audioLoop(audioExtractor!!, audioCodec!!, audioTrack!!, gen) }
+                // === 4. 并行解码 ===
+                val vj = launch { decodeVideo(vExt!!, vCodec!!, seq) }
+                val aj = if (aExt != null && aCodec != null && aTrack != null) {
+                    launch { decodeAudio(aExt!!, aCodec!!, aTrack!!, seq) }
                 } else null
-                vJob.join()
-                aJob?.cancel()
+                vj.join()
+                aj?.cancel()
 
-                if (gen == currentGen) {
+                if (seq == currentSeq) {
                     _state.value = State.COMPLETED
-                    Log.d(TAG, "Video done (gen=$gen)")
+                    Log.d(TAG, "Completed (seq=$seq)")
                 }
 
             } catch (e: CancellationException) {
-                throw e // 正常取消，由 finally 清理
+                throw e
             } catch (e: Exception) {
-                Log.e(TAG, "prepareAndPlay failed (gen=$gen)", e)
-                if (gen == currentGen) _state.value = State.ERROR
+                Log.e(TAG, "Error (seq=$seq)", e)
+                if (seq == currentSeq) _state.value = State.ERROR
             } finally {
-                // 清理本代资源
-                Log.d(TAG, "Cleaning up gen=$gen resources")
-                try { videoCodec?.stop(); videoCodec?.release() } catch (_: Exception) {}
-                try { audioCodec?.stop(); audioCodec?.release() } catch (_: Exception) {}
-                try { videoExtractor?.release() } catch (_: Exception) {}
-                try { audioExtractor?.release() } catch (_: Exception) {}
-                try { audioTrack?.stop(); audioTrack?.release() } catch (_: Exception) {}
-                Log.d(TAG, "Cleanup done for gen=$gen")
+                Log.d(TAG, "Cleanup seq=$seq")
+                releaseRes(vCodec, aCodec, vExt, aExt, aTrack)
             }
         }
     }
 
-    // ==================== 视频解码循环 ====================
+    // ==================== 视频解码 ====================
 
-    private fun videoLoop(ext: MediaExtractor, codec: MediaCodec, gen: Int) {
+    private fun decodeVideo(ext: MediaExtractor, codec: MediaCodec, seq: Int) {
         val info = MediaCodec.BufferInfo()
-        var inputEOS = false
-        var outputEOS = false
-        var firstFrameRendered = false
+        var inEos = false
+        var outEos = false
+        var firstDone = false
 
-        while (!outputEOS && gen == currentGen) {
-            if (isPaused.get()) { Thread.sleep(30); continue }
+        while (!outEos && seq == currentSeq) {
+            if (isPaused.get()) { Thread.sleep(15); continue }
 
-            try {
-                // 输入
-                if (!inputEOS) {
-                    val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
-                    if (inIdx >= 0) {
-                        val buf = codec.getInputBuffer(inIdx) ?: continue
-                        val size = ext.readSampleData(buf, 0)
-                        if (size < 0) {
-                            codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inputEOS = true
+            // 送数据
+            if (!inEos) {
+                try {
+                    val idx = codec.dequeueInputBuffer(TIMEOUT_US)
+                    if (idx >= 0) {
+                        val buf = codec.getInputBuffer(idx) ?: continue
+                        val n = ext.readSampleData(buf, 0)
+                        if (n < 0) {
+                            codec.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inEos = true
                         } else {
-                            codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
+                            codec.queueInputBuffer(idx, 0, n, ext.sampleTime, 0)
                             ext.advance()
                         }
                     }
+                } catch (e: Exception) {
+                    if (seq == currentSeq) Log.e(TAG, "Video input error", e)
+                    break
                 }
+            }
 
-                // 输出
-                val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
+            // 取帧
+            try {
+                val idx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
                 when {
-                    outIdx >= 0 -> {
-                        val isEOS = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                        if (isEOS) outputEOS = true
+                    idx >= 0 -> {
+                        val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                        if (eos) outEos = true
 
-                        if (!firstFrameRendered && info.size > 0) {
-                            codec.releaseOutputBuffer(outIdx, true)
-                            firstFrameRendered = true
-                            mediaStartTimeUs = info.presentationTimeUs
-                            wallStartTimeUs = System.nanoTime() / 1000
+                        if (!firstDone && info.size > 0) {
+                            // 首帧立即渲染
+                            codec.releaseOutputBuffer(idx, true)
+                            firstDone = true
+                            mediaStartUs = info.presentationTimeUs
+                            wallStartUs = System.nanoTime() / 1000
                             _currentPosition.value = info.presentationTimeUs / 1000
-                            Log.d(TAG, "First frame: ${info.presentationTimeUs / 1000}ms")
+                            Log.d(TAG, "First frame ${info.presentationTimeUs / 1000}ms")
                             continue
                         }
 
-                        val render = info.size > 0 && shouldRender(info.presentationTimeUs)
-                        codec.releaseOutputBuffer(outIdx, render)
+                        val render = info.size > 0 && checkPts(info.presentationTimeUs)
+                        codec.releaseOutputBuffer(idx, render)
                         if (info.size > 0) _currentPosition.value = info.presentationTimeUs / 1000
                     }
-                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                        Thread.sleep(2)
-                    }
-                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        Log.d(TAG, "Video format: ${codec.outputFormat}")
-                    }
+                    idx == MediaCodec.INFO_TRY_AGAIN_LATER -> Thread.sleep(2)
+                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
+                        Log.d(TAG, "Vfmt: ${codec.outputFormat}")
                 }
             } catch (e: Exception) {
-                if (gen != currentGen) break // 被取消，正常退出
-                Log.e(TAG, "Video loop error (gen=$gen)", e)
+                if (seq == currentSeq) Log.e(TAG, "Video output error", e)
                 break
             }
         }
-        Log.d(TAG, "Video loop exit (gen=$gen, currentGen=$currentGen)")
+        Log.d(TAG, "Video exit seq=$seq cur=$currentSeq")
     }
 
-    // ==================== 音频解码循环 ====================
+    // ==================== 音频解码 ====================
 
-    private fun audioLoop(ext: MediaExtractor, codec: MediaCodec, track: AudioTrack, gen: Int) {
+    private fun decodeAudio(ext: MediaExtractor, codec: MediaCodec, track: AudioTrack, seq: Int) {
         val info = MediaCodec.BufferInfo()
-        var inputEOS = false
-        var outputEOS = false
+        var inEos = false
+        var outEos = false
 
-        while (!outputEOS && gen == currentGen) {
-            if (isPaused.get()) { Thread.sleep(30); continue }
+        while (!outEos && seq == currentSeq) {
+            if (isPaused.get()) { Thread.sleep(15); continue }
 
-            try {
-                // 输入
-                if (!inputEOS) {
-                    val inIdx = codec.dequeueInputBuffer(TIMEOUT_US)
-                    if (inIdx >= 0) {
-                        val buf = codec.getInputBuffer(inIdx) ?: continue
-                        val size = ext.readSampleData(buf, 0)
-                        if (size < 0) {
-                            codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inputEOS = true
+            if (!inEos) {
+                try {
+                    val idx = codec.dequeueInputBuffer(TIMEOUT_US)
+                    if (idx >= 0) {
+                        val buf = codec.getInputBuffer(idx) ?: continue
+                        val n = ext.readSampleData(buf, 0)
+                        if (n < 0) {
+                            codec.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inEos = true
                         } else {
-                            codec.queueInputBuffer(inIdx, 0, size, ext.sampleTime, 0)
+                            codec.queueInputBuffer(idx, 0, n, ext.sampleTime, 0)
                             ext.advance()
                         }
                     }
+                } catch (e: Exception) {
+                    if (seq == currentSeq) Log.e(TAG, "Audio input error", e)
+                    break
                 }
+            }
 
-                // 输出：PCM → AudioTrack
-                val outIdx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
+            try {
+                val idx = codec.dequeueOutputBuffer(info, TIMEOUT_US)
                 when {
-                    outIdx >= 0 -> {
-                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputEOS = true
-                        val buf = codec.getOutputBuffer(outIdx) ?: continue
-                        if (info.size > 0) {
+                    idx >= 0 -> {
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outEos = true
+                        val buf = codec.getOutputBuffer(idx)
+                        if (buf != null && info.size > 0) {
                             val pcm = ByteArray(info.size)
                             buf.position(info.offset)
                             buf.limit(info.offset + info.size)
                             buf.get(pcm)
                             track.write(pcm, 0, info.size)
                         }
-                        codec.releaseOutputBuffer(outIdx, false)
+                        codec.releaseOutputBuffer(idx, false)
                     }
-                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                        Thread.sleep(2)
-                    }
-                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        Log.d(TAG, "Audio format: ${codec.outputFormat}")
-                    }
+                    idx == MediaCodec.INFO_TRY_AGAIN_LATER -> Thread.sleep(2)
+                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
+                        Log.d(TAG, "Afmt: ${codec.outputFormat}")
                 }
             } catch (e: Exception) {
-                if (gen != currentGen) break
-                Log.e(TAG, "Audio loop error (gen=$gen)", e)
+                if (seq == currentSeq) Log.e(TAG, "Audio output error", e)
                 break
             }
         }
-        Log.d(TAG, "Audio loop exit (gen=$gen)")
+        Log.d(TAG, "Audio exit seq=$seq")
     }
 
-    // ==================== 音视频同步 ====================
+    // ==================== 同步 ====================
 
-    private fun shouldRender(presentationTimeUs: Long): Boolean {
-        val nowUs = System.nanoTime() / 1000
-        if (wallStartTimeUs < 0L) return true
-        val mediaElapsed = presentationTimeUs - mediaStartTimeUs
-        val wallElapsed = nowUs - wallStartTimeUs
-        return mediaElapsed <= wallElapsed + 30_000
+    private fun checkPts(ptsUs: Long): Boolean {
+        val wall = wallStartUs
+        if (wall < 0L) return true
+        val now = System.nanoTime() / 1000
+        return (ptsUs - mediaStartUs) <= (now - wall) + 30_000
     }
 
-    // ==================== 播放控制 ====================
+    // ==================== 控制 ====================
 
     fun play() {
         isPaused.set(false)
-        wallStartTimeUs = -1L
+        wallStartUs = -1L
         if (_state.value == State.PAUSED || _state.value == State.COMPLETED) _state.value = State.PLAYING
-        Log.d(TAG, "Play")
     }
 
     fun pause() {
         isPaused.set(true)
         if (_state.value == State.PLAYING) _state.value = State.PAUSED
-        Log.d(TAG, "Pause")
     }
 
     fun togglePlayPause() {
@@ -329,32 +315,32 @@ class VideoPlayer {
         }
     }
 
-    fun seekTo(positionMs: Long) {
-        _currentPosition.value = positionMs
-    }
-
-    fun setSpeed(speed: Float) { Log.d(TAG, "Speed: $speed") }
+    fun seekTo(ms: Long) { _currentPosition.value = ms }
+    fun setSpeed(speed: Float) { Log.d(TAG, "Speed $speed") }
 
     // ==================== 释放 ====================
 
     fun release() {
-        Log.d(TAG, "Releasing (gen=$currentGen)...")
-        currentGen++
-        val job = currentJob
-        if (job != null) {
-            job.cancel()
-            // 等待资源释放完成（最多 2 秒）
-            try {
-                runBlocking { withTimeout(2000) { job.join() } }
-            } catch (_: TimeoutCancellationException) {
-                Log.w(TAG, "Release timeout, forcing cleanup")
-            }
-        }
-        currentJob = null
+        Log.d(TAG, "release()")
+        currentSeq++
+        job?.cancel()
+        job = null
         _state.value = State.IDLE
         _currentPosition.value = 0L
-        mediaStartTimeUs = -1L
-        wallStartTimeUs = -1L
-        Log.d(TAG, "Released")
+        _duration.value = 0L
+        mediaStartUs = -1L
+        wallStartUs = -1L
+    }
+
+    private fun releaseRes(
+        vc: MediaCodec?, ac: MediaCodec?,
+        ve: MediaExtractor?, ae: MediaExtractor?,
+        at: AudioTrack?
+    ) {
+        try { vc?.stop(); vc?.release() } catch (_: Exception) {}
+        try { ac?.stop(); ac?.release() } catch (_: Exception) {}
+        try { ve?.release() } catch (_: Exception) {}
+        try { ae?.release() } catch (_: Exception) {}
+        try { at?.stop(); at?.release() } catch (_: Exception) {}
     }
 }

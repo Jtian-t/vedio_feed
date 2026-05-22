@@ -12,12 +12,6 @@ import com.example.feedvideo.player.VideoPlayer
 
 /**
  * 全屏视频播放 Composable — AndroidView 包裹 SurfaceView。
- * 通过 MediaCodec 渲染视频帧。
- *
- * 不使用 DisposableEffect 调用 release()：
- * - prepareAndPlay 内部通过 generation 计数器自动取消旧任务并释放旧资源
- * - player.release() 仅由 ViewModel.onCleared() 调用
- * - 避免 DisposableEffect onDispose 和 LaunchedEffect 之间的竞态
  */
 @Composable
 fun VideoPlayerView(
@@ -35,6 +29,13 @@ fun VideoPlayerView(
             if (surface != null && surface.isValid) {
                 player.prepareAndPlay(videoUrl, surface)
             }
+        }
+    }
+
+    // URL 变化或 composable 离开时释放资源
+    DisposableEffect(videoUrl) {
+        onDispose {
+            player.release()
         }
     }
 
